@@ -12,7 +12,7 @@ con hardening de seguridad según el benchmark CIS.
 En un servidor Ubuntu 24.04 recién instalado, ejecutar como root:
 
 ```bash
-wget -qO install_frappe16.sh https://github.com/izone-ni/frappe-scripts/releases/download/v16.0.0/install_frappe16.sh && sudo bash install_frappe16.sh
+wget -qO install_frappe16.sh https://github.com/izone-ni/frappe-scripts/releases/latest/download/install_frappe16.sh && sudo bash install_frappe16.sh
 ```
 
 El script pedirá al inicio los datos de configuración (usuario, puerto SSH,
