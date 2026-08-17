@@ -2,7 +2,7 @@
 # =============================================================================
 #  install_frappe.sh — Frappe 16 / ERPNext — Aprovisionador Automatizado iZone
 #  Estándar : CIS Ubuntu 24.04 LTS Benchmark v1.0.0
-#  Versión  : 6.0.0  (2026-08-14 — Arquitectura de dos fases)
+#  Versión  : 16.0.1  (2026-08-17 — Fix host keys SSH en sistema nuevo)
 #  Autor    : DevOps Engineering Team — iZone
 # =============================================================================
 #
@@ -523,7 +523,7 @@ if [[ -f "$PHASE2_MARKER" && "$CURRENT_USER" != "root" ]]; then
     if ! sudo grep -q "server_tokens off" "$NGINX_CONF"; then
         sudo sed -i '/http {/a\
 \
-    # === CIS Hardening — iZone install_frappe.sh v6.0.0 ===\
+    # === CIS Hardening — iZone install_frappe.sh ===\
     server_tokens off;\
     add_header X-Frame-Options SAMEORIGIN;\
     add_header X-Content-Type-Options nosniff;\
@@ -733,7 +733,7 @@ fi
 # =============================================================================
 # =============================================================================
 
-header "APROVISIONADOR FRAPPE 16 — iZone Enterprise  [v6.0.0]"
+header "APROVISIONADOR FRAPPE 16 — iZone Enterprise  [v16.0.1]"
 
 [[ "$EUID" -ne 0 ]] && die "La Fase 1 debe ejecutarse como root. Usa: sudo bash $0"
 
@@ -1003,14 +1003,35 @@ progress_tick "Llave SSH"
 
 # 1.7 Banners
 section "1.7 — Banners de Seguridad"
+
+# Generar el arte ASCII con el NOMBRE REAL de la empresa.
+# Usamos figlet (estándar Linux para ASCII art). Si no está disponible o
+# falla, caemos a un banner de texto con el nombre — el aprovisionamiento
+# NUNCA se detiene por el banner.
+step "Generando arte ASCII del banner para '${COMPANY_NAME}'..."
+
+# Instalar figlet (silencioso; si falla, seguimos con el fallback)
+apt_safe install -y -q figlet >> "$LOG_FILE" 2>&1 || true
+
+COMPANY_ASCII=""
+if command -v figlet >/dev/null 2>&1; then
+    # Generar el arte. Capturamos por si el nombre tuviera algo problemático.
+    COMPANY_ASCII="$(figlet -w 76 "${COMPANY_NAME}" 2>/dev/null || true)"
+fi
+
+# Fallback: si figlet no produjo nada, usar el nombre en texto centrado.
+if [[ -z "$COMPANY_ASCII" ]]; then
+    COMPANY_ASCII="                    ${COMPANY_NAME}"
+fi
+
+# Construir el bloque del banner con el arte prefijando cada línea con "#  ".
+# Esto mantiene el marco de ##### alrededor del arte generado.
+BANNER_ART="$(echo "$COMPANY_ASCII" | sed 's/^/#  /')"
+
 cat > /etc/issue.net << EOF
 ###############################################################################
 #                                                                             #
-#         _  _____                                                            #
-#        (_)|__  /___  _ __    ___                                            #
-#        | |  / // _ \| '_ \  / _ \                                           #
-#        | | / /| (_) | | | ||  __/                                           #
-#        |_|/____\___/|_| |_| \___|                                           #
+${BANNER_ART}
 #                                                                             #
 #                       AVISO DE ACCESO RESTRINGIDO                           #
 #                                                                             #
@@ -1043,13 +1064,22 @@ Usted ha iniciado sesion en un servidor privado de ${COMPANY_NAME}.
 EL ABUSO O USO NO AUTORIZADO CONLLEVA SANCIONES LEGALES.
 ===============================================================================
 EOF
-ok "Banners configurados."
+ok "Banners configurados con el nombre '${COMPANY_NAME}'."
 progress_tick "Banners"
 
 # 1.8 Hardening SSH
 section "1.8 — Hardening SSH (CIS 5.2)"
+
+# CRÍTICO en sistemas nuevos/minimal: openssh-server recién instalado puede
+# NO tener host keys generadas todavía. Sin ellas, `sshd -t` falla con
+# "no hostkeys available". ssh-keygen -A genera todas las claves faltantes
+# (es idempotente: no toca las que ya existen).
+step "Generando host keys de SSH si no existen..."
+ssh-keygen -A >> "$LOG_FILE" 2>&1 || true
+ok "Host keys de SSH verificadas."
+
 cat > /etc/ssh/sshd_config.d/99-custom.conf << EOF
-# ${COMPANY_NAME} — SSH Hardened (CIS 5.2) — install_frappe.sh v6.0.0
+# ${COMPANY_NAME} — SSH Hardened (CIS 5.2) — install_frappe.sh
 Port ${SSH_PORT}
 PasswordAuthentication no
 PermitRootLogin no
@@ -1064,7 +1094,23 @@ AllowTcpForwarding yes
 Banner /etc/issue.net
 EOF
 
-sshd -t >> "$LOG_FILE" 2>&1 || die "Sintaxis SSH inválida. Revisa ${LOG_FILE}"
+# Validar sintaxis. Si falla, MOSTRAR el error real de sshd -t en pantalla,
+# no solo un mensaje genérico — así el operador ve exactamente qué pasó.
+# Usamos la ruta completa del binario (/usr/sbin/sshd) por robustez.
+SSHD_BIN="$(command -v sshd || echo /usr/sbin/sshd)"
+step "Validando configuración SSH..."
+SSHD_TEST_OUTPUT="$("$SSHD_BIN" -t 2>&1)"
+SSHD_TEST_RC=$?
+echo "$SSHD_TEST_OUTPUT" >> "$LOG_FILE"
+
+if (( SSHD_TEST_RC != 0 )); then
+    err "La validación de SSH (sshd -t) falló. Mensaje real:"
+    echo -e "  ${CLR_RED}${SSHD_TEST_OUTPUT}${CLR_RESET}"
+    err "Configuración generada en /etc/ssh/sshd_config.d/99-custom.conf:"
+    sed 's/^/    /' /etc/ssh/sshd_config.d/99-custom.conf
+    die "Sintaxis SSH inválida (ver mensaje arriba). Log: ${LOG_FILE}"
+fi
+ok "Configuración SSH válida."
 spinner_start "Reiniciando SSH en puerto ${SSH_PORT}..."
 systemctl stop ssh.socket >> "$LOG_FILE" 2>&1 || true
 systemctl disable ssh.socket >> "$LOG_FILE" 2>&1 || true
