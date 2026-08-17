@@ -2,7 +2,7 @@
 # =============================================================================
 #  install_frappe.sh — Frappe 16 / ERPNext — Aprovisionador Automatizado iZone
 #  Estándar : CIS Ubuntu 24.04 LTS Benchmark v1.0.0
-#  Versión  : 16.0.1  (2026-08-17 — Fix host keys SSH en sistema nuevo)
+#  Versión  : 16.0.2  (2026-08-17 — Fix privilege sep dir + set -e en sshd -t)
 #  Autor    : DevOps Engineering Team — iZone
 # =============================================================================
 #
@@ -548,7 +548,7 @@ if [[ -f "$PHASE2_MARKER" && "$CURRENT_USER" != "root" ]]; then
     sudo ln -sf "${BENCH_DIR}/config/supervisor.conf"  /etc/supervisor/conf.d/frappe-bench.conf
 
     # Symlink node para Supervisor (Socket.io)
-    NODE_REAL="$(command -v node)"
+    NODE_REAL="$(command -v node || true)"
     if [[ -n "$NODE_REAL" ]]; then
         sudo ln -sf "$NODE_REAL" /usr/bin/node       2>/dev/null || true
         sudo ln -sf "$NODE_REAL" /usr/local/bin/node 2>/dev/null || true
@@ -629,7 +629,7 @@ if [[ -f "$PHASE2_MARKER" && "$CURRENT_USER" != "root" ]]; then
     mysql -u root -p"${MARIADB_ROOT_PASS}" -e "SELECT 1;" > /dev/null 2>&1 \
         && audit_check "MariaDB — Auth root" "ok"   "Conexión exitosa" \
         || audit_check "MariaDB — Auth root" "fail" "Fallo de autenticación" "critical"
-    DB_CS=$(mysql -u root -p"${MARIADB_ROOT_PASS}" -e "SHOW VARIABLES LIKE 'character_set_server';" 2>/dev/null | grep character_set_server | awk '{print $2}')
+    DB_CS=$(mysql -u root -p"${MARIADB_ROOT_PASS}" -e "SHOW VARIABLES LIKE 'character_set_server';" 2>/dev/null | grep character_set_server | awk '{print $2}' || true)
     [[ "$DB_CS" == "utf8mb4" ]] \
         && audit_check "MariaDB — charset" "ok" "utf8mb4" \
         || audit_check "MariaDB — charset" "warn" "${DB_CS:-desconocido}"
@@ -662,7 +662,7 @@ if [[ -f "$PHASE2_MARKER" && "$CURRENT_USER" != "root" ]]; then
         || audit_check "Frappe — site_config.json" "fail" "No encontrado" "critical"
 
     section "Validación — Memoria"
-    SWAP_TOT=$(free -h | grep Swap | awk '{print $2}')
+    SWAP_TOT=$(free -h | grep Swap | awk '{print $2}' || true)
     if [[ "$SWAP_TOT" != "0B" && -n "$SWAP_TOT" ]]; then
         audit_check "Swap" "ok" "Activo: ${SWAP_TOT}"
     elif (( TOTAL_RAM_GB >= 8 )); then
@@ -733,7 +733,7 @@ fi
 # =============================================================================
 # =============================================================================
 
-header "APROVISIONADOR FRAPPE 16 — iZone Enterprise  [v16.0.1]"
+header "APROVISIONADOR FRAPPE 16 — iZone Software  [v16.0.2]"
 
 [[ "$EUID" -ne 0 ]] && die "La Fase 1 debe ejecutarse como root. Usa: sudo bash $0"
 
@@ -1078,6 +1078,13 @@ step "Generando host keys de SSH si no existen..."
 ssh-keygen -A >> "$LOG_FILE" 2>&1 || true
 ok "Host keys de SSH verificadas."
 
+# CRÍTICO en sistemas nuevos: sshd -t falla con código 255 y el mensaje
+# "Missing privilege separation directory: /run/sshd" si ese directorio no
+# existe todavía (ocurre cuando SSH nunca ha arrancado en el sistema).
+# Crearlo es seguro e idempotente.
+mkdir -p /run/sshd
+chmod 0755 /run/sshd
+
 cat > /etc/ssh/sshd_config.d/99-custom.conf << EOF
 # ${COMPANY_NAME} — SSH Hardened (CIS 5.2) — install_frappe.sh
 Port ${SSH_PORT}
@@ -1094,23 +1101,24 @@ AllowTcpForwarding yes
 Banner /etc/issue.net
 EOF
 
-# Validar sintaxis. Si falla, MOSTRAR el error real de sshd -t en pantalla,
-# no solo un mensaje genérico — así el operador ve exactamente qué pasó.
-# Usamos la ruta completa del binario (/usr/sbin/sshd) por robustez.
+# Validar sintaxis. Si falla, MOSTRAR el error real de sshd -t en pantalla.
+# IMPORTANTE: usamos 'if' para capturar el fallo. Bajo 'set -e', una
+# asignación como VAR="$(cmd)" abortaría el script si cmd falla, ANTES de
+# poder mostrar el error. El 'if' es la construcción que set -e NO aborta.
 SSHD_BIN="$(command -v sshd || echo /usr/sbin/sshd)"
 step "Validando configuración SSH..."
-SSHD_TEST_OUTPUT="$("$SSHD_BIN" -t 2>&1)"
-SSHD_TEST_RC=$?
-echo "$SSHD_TEST_OUTPUT" >> "$LOG_FILE"
 
-if (( SSHD_TEST_RC != 0 )); then
-    err "La validación de SSH (sshd -t) falló. Mensaje real:"
-    echo -e "  ${CLR_RED}${SSHD_TEST_OUTPUT}${CLR_RESET}"
+if SSHD_TEST_OUTPUT="$("$SSHD_BIN" -t 2>&1)"; then
+    echo "$SSHD_TEST_OUTPUT" >> "$LOG_FILE"
+    ok "Configuración SSH válida."
+else
+    echo "$SSHD_TEST_OUTPUT" >> "$LOG_FILE"
+    err "La validación de SSH (sshd -t) falló. Mensaje real de sshd:"
+    echo -e "  ${CLR_RED}${SSHD_TEST_OUTPUT:-<sin salida>}${CLR_RESET}"
     err "Configuración generada en /etc/ssh/sshd_config.d/99-custom.conf:"
     sed 's/^/    /' /etc/ssh/sshd_config.d/99-custom.conf
     die "Sintaxis SSH inválida (ver mensaje arriba). Log: ${LOG_FILE}"
 fi
-ok "Configuración SSH válida."
 spinner_start "Reiniciando SSH en puerto ${SSH_PORT}..."
 systemctl stop ssh.socket >> "$LOG_FILE" 2>&1 || true
 systemctl disable ssh.socket >> "$LOG_FILE" 2>&1 || true
