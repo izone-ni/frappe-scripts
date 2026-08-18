@@ -14,6 +14,10 @@ En un servidor Ubuntu 24.04 recién instalado, ejecutar como root:
 ```bash
 wget -qO install_frappe16.sh https://github.com/izone-ni/frappe-scripts/releases/latest/download/install_frappe16.sh && sudo bash install_frappe16.sh
 ```
+o
+```bash
+wget -qO install_frappe16_main.sh https://github.com/izone-ni/frappe-scripts/releases/latest/download/install_frappe16_main.sh && sudo bash install_frappe16_main.sh
+```
 
 El script pedirá al inicio los datos de configuración (usuario, puerto SSH,
 contraseñas, llave SSH, nombre del sitio). A partir de ahí, corre de forma
