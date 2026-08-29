@@ -1,4 +1,188 @@
-
+#!/usr/bin/env bash
+# =============================================================================
+#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v2.0.0  (unificado)
+#  https://github.com/izone-ni/frappe-scripts
+#  Despliegue automatizado + hardening de Frappe 16 / ERPNext 16
+#  Base: Ubuntu 24.04 LTS   Refs: CIS Ubuntu 24.04 v1.0.0, CIS NGINX v3.0.0
+#
+#  USO:
+#     sudo -i
+#     bash bashcore-frappe16-v2.sh              # instalación / reanudación
+#     bash bashcore-frappe16-v2.sh --status     # ver qué pasos van completados
+#     bash bashcore-frappe16-v2.sh --reset      # olvidar el progreso y empezar
+#
+#  ENTORNO: VM, hardware físico o CONTENEDOR LXC de Proxmox (CT).
+#  El script detecta el entorno y se adapta. En un CT hay operaciones que el
+#  kernel del host NO delega al contenedor; se detallan en 'AJUSTES EN EL
+#  NODO PROXMOX' al final de esta cabecera.
+#
+#  CAMBIOS v11 (el prompt "[sudo] password for sysadmin" que bloqueaba init):
+#   CAUSA, en bench/utils/bench.py:340
+#       supervisor_status = get_cmd_output("supervisorctl status")
+#       except CalledProcessError:
+#           sudo = "sudo "
+#           supervisor_status = get_cmd_output("sudo supervisorctl status")
+#   Supervisor se instala en la Fase 3, así que 'supervisorctl' EXISTE pero
+#   su socket es sólo de root: PermissionError -> bench reintenta con sudo
+#   -> sudo abre /dev/tty (no stdin) y espera la contraseña para siempre.
+#   Cerrar stdin con /dev/null no lo evita: sudo no lee de stdin.
+#
+#   [S1] El socket de Supervisor se comparte con el usuario operativo, así
+#        que 'supervisorctl status' funciona SIN sudo y bench nunca escala.
+#   [S2] Red de seguridad: sudoers NOPASSWD para el usuario durante la
+#        instalación, reducido al final a los comandos que Frappe necesita
+#        en producción (supervisorctl, systemctl, service, nginx).
+#   [S3] SUDO_ASKPASS=/bin/false + 'Defaults !requiretty': si algún sudo se
+#        escapara, falla al instante en vez de bloquear.
+#   [S4] El monitor detecta "[sudo] password for" en el log y lo explica.
+#
+#  CAMBIOS v10:
+#   [Z1] Marca iZone y barra de progreso DESDE EL PRIMER PASO (22 pasos,
+#        no sólo la fase de usuario).
+#   [Z2] Las dependencias se instalan solas: sin preguntas y/n. Se listan
+#        los paquetes y se informa de cada acción.
+#   [Z3] La confirmación es la palabra LISTO. Cualquier otra cosa repite
+#        las 7 preguntas; SALIR termina el programa.
+#   [Z4] Verificación previa de red y de que las 5 ramas existan en GitHub
+#        ANTES de invertir 20 minutos en la descarga.
+#   [Z5] 'bench init' con tres intentos escalonados: uv -> pip clásico
+#        (BENCH_DISABLE_UV=1) -> Python 3.12. Entre intentos se aparta el
+#        directorio a medias, que es lo que bloquea los reintentos.
+#
+#  CAMBIOS v9 (causa verificada en el código de frappe-bench 5.31.0):
+#   bench/commands/make.py, línea 105:
+#       log(f"There was a problem while creating {path}", level=2)
+#       if click.confirm("Do you want to rollback these changes?", abort=True):
+#   Es decir: cuando 'bench init' FALLA, pregunta si deshacer los cambios y
+#   se queda esperando una tecla. Con un pseudo-terminal y sin nadie que
+#   responda, espera para siempre: 0% de CPU, sin hijos, sin escribir.
+#   EL CUELGUE ERA EL SÍNTOMA; la causa es un fallo anterior cuyo mensaje
+#   está más arriba en el log de la fase de usuario.
+#
+#   [A1] Con la entrada en /dev/null (v7) ese confirm recibe EOF y aborta,
+#        así que ya no se cuelga; ahora además se DETECTA el rastro del
+#        prompt en el log y se extrae el error real que lo provocó.
+#   [A2] TERM=dumb y NO_COLOR: salida plana, sin secuencias de control.
+#   [A3] Reintento automático con BENCH_DISABLE_UV=1 (variable real de
+#        bench 5.31: uv está activo POR DEFECTO, no hay ningún flag --uv).
+#   [A4] Comprobación previa de wheels para la versión de Python elegida,
+#        con opción de cambiarla antes de empezar.
+#
+#  CAMBIOS v8 ('bench init' parecía inmóvil durante media hora):
+#   [D1] 'bench init' son en realidad tres tareas largas encadenadas (clonar
+#        frappe, construir el entorno Python, instalar dependencias JS). Se
+#        mostraba como UNA línea quieta: imposible saber si avanzaba. Ahora
+#        el paso en curso muestra en qué subtarea está, cuántos minutos lleva
+#        y cuánto ha crecido el directorio.
+#   [D2] Junto al paso activo se muestra la última línea real del log, así
+#        se ve el trabajo concreto sin volcar miles de líneas en pantalla.
+#   [D3] El resumen del log incluye el mismo detalle, para que el archivo
+#        cuente la misma historia que la pantalla.
+#
+#  CAMBIOS v7 ('bench' al 0% de CPU, bloqueado para siempre):
+#   [P1] CAUSA: al lanzarlo bajo 'screen' el proceso recibía un terminal
+#        interactivo. Cualquier pregunta (git pidiendo credenciales, un
+#        confirm de bench) se escribía al pty y NO al log: silencio total
+#        con el proceso esperando una tecla eternamente. Ahora la entrada
+#        es /dev/null: preguntar produce EOF y un error inmediato y visible.
+#   [P2] Variables anti-prompt: GIT_TERMINAL_PROMPT=0, GIT_ASKPASS,
+#        PIP_NO_INPUT, DEBIAN_FRONTEND, CI=1.
+#   [P3] La salida se captura con 'script', así que si algún comando
+#        escribe al terminal en vez de a stdout, TAMBIÉN queda en el log.
+#   [P4] Interfaz nueva: barra de progreso y lista de verificación de lo
+#        instalado. El detalle va al log; en pantalla sólo el avance.
+#   [P5] Diagnóstico automático: si algo falla o se cuelga, el .tar.gz se
+#        genera solo y se te indica la ruta.
+#   [P6] Sin SSL/certbot y sin snapshots: despliegue local. Se registra el
+#        sitio en /etc/hosts para poder abrirlo desde el propio servidor.
+#   [P7] El detector de atasco distingue "0% de CPU" (bloqueado esperando
+#        entrada) de "con CPU pero sin escribir" (trabajando).
+#
+#  CAMBIOS v6 (el 'yarn install' parecía colgado):
+#   [V1] Se ELIMINA '--verbose' de 'bench init'. Hacía que yarn imprimiera
+#        una línea por cada uno de los ~60.000 archivos copiados: cientos de
+#        MB de log y, sobre todo, la propia instrumentación (pipe -> tee ->
+#        disco -> espejo tail/sed) frenando la instalación que observaba.
+#   [V2] El latido ya no dice solo "sin salida nueva": mide si frappe-bench
+#        CRECE en disco. yarn copiando en silencio y un proceso congelado
+#        producían exactamente el mismo mensaje, siendo opuestos.
+#   [V3] Detección de la causa real de congelación en un CT: presión del
+#        cgroup de memoria (memory.events), OOM killer, disco e inodos.
+#   [V4] Si no hay NI salida NI crecimiento en disco durante 20 min, se
+#        detiene con un diagnóstico concreto en vez de esperar al timeout.
+#   [V5] Comprobación de recursos ANTES de bench init (RAM+swap y disco).
+#
+#  CAMBIOS v5 (el 'bench init' se quedaba pegado):
+#   [S1] CAUSA: 'ClientAliveCountMax 0' + 'ClientAliveInterval 300' cierran la
+#        sesión SSH a los 5 min SIN datos. 'bench init' pasa minutos callado
+#        (git clone, uv venv, yarn install) => sshd mataba la sesión y con
+#        ella el script, dejando frappe-bench a medias. Ahora CountMax=3.
+#   [S2] Las Fases 3.2-6 se ejecutan DESACOPLADAS en una sesión 'screen'
+#        (o setsid/nohup si no hay screen): si tu SSH se cae, la instalación
+#        sigue. Al relanzar el script, se reengancha al proceso en curso.
+#   [S3] Latido de progreso cada 20s con tiempo transcurrido, para distinguir
+#        "trabajando en silencio" de "colgado".
+#   [S4] Timeouts por paso (init 60m, get-app 30m, install-app 30m): si algo
+#        se cuelga de verdad, falla con mensaje claro en vez de esperar horas.
+#   [S5] frappe-bench incompleto de un intento anterior: se aparta a
+#        frappe-bench.roto-<fecha> para que el reintento pueda avanzar.
+#   [S6] 'bench init --skip-assets': los assets se compilan UNA vez al final
+#        (menos RAM, menos tiempo, no se construye dos veces).
+#   [S7] Nuevo modo '--diag': empaqueta todos los logs en un .tar.gz para
+#        compartir cuando algo falle.
+#   [S8] PYTHONUNBUFFERED=1: el log se escribe línea a línea y no en bloques.
+#
+#  CAMBIOS v4:
+#   [F1] CAUSA RAÍZ del "Access denied" en la Fase 2: se elimina
+#        'skip-name-resolve'. Con esa opción MariaDB deja de traducir
+#        127.0.0.1 -> 'localhost', así que 'root'@'localhost' sólo sirve por
+#        socket y TODA conexión TCP falla. Además habría roto el usuario que
+#        crea 'bench new-site' (se crea como usuario@'localhost' y Frappe se
+#        conecta por TCP): el sitio no habría podido leer su propia BD.
+#   [F2] Se crean explícitamente 'root'@'127.0.0.1' y 'root'@'::1'.
+#   [F3] Sondeo de 3 modos de conexión (socket+clave, TCP+clave, socket sin
+#        clave) para que el script sea reanudable en cualquier estado.
+#   [F4] La contraseña del usuario operativo AHORA SE PREGUNTA (7 preguntas).
+#   [F5] Dependencias faltantes: se listan y se pide confirmación y/n antes
+#        de instalarlas.
+#   [F6] Usuario existente: no se recrea; se valida grupo sudo, home y shell.
+#   [F7] Versionado del estado: al venir de una versión anterior, se
+#        invalidan los pasos de MariaDB para reaplicar la corrección.
+#   [F8] Inventario final de apps instaladas en el sitio.
+#
+#  CAMBIOS v3 (soporte Proxmox CT):
+#   [P1] Detección de LXC/CT y de si es privilegiado o no privilegiado.
+#   [P2] Zona horaria: timedatectl falla sin bus systemd; fallback a symlink.
+#   [P3] Swap: NO se crea dentro del CT (lo gestiona el host). Instrucciones.
+#   [P4] Locale UTF-8: las plantillas LXC vienen en POSIX y bench/Frappe
+#        fallan al procesar caracteres no ASCII.
+#   [P5] Paquetes que las plantillas LXC omiten (sudo, openssh-server, etc).
+#   [P6] MariaDB: AIO nativo desactivado y LimitNOFILE acotado; sin esto el
+#        servicio no arranca en muchos CT.
+#   [P7] UFW/sysctl: no fallan el despliegue; el firewall va en Proxmox.
+#   [P8] NODE_OPTIONS acotado para que 'bench build' no muera por OOM.
+#   [P9] Verificación de systemd como PID 1 (el script depende de systemctl).
+#
+#  AJUSTES EN EL NODO PROXMOX (ejecutar en el HOST, no en el CT):
+#     pct set <VMID> --memory 8192 --swap 4096   # 4GB+ o el build muere
+#     pct set <VMID> --cores 4
+#     pct set <VMID> --onboot 1
+#     # Recomendado para que Redis no advierta por overcommit:
+#     sysctl -w vm.overcommit_memory=1 && echo 'vm.overcommit_memory=1' >> /etc/sysctl.conf
+#     # Un CT NO privilegiado es suficiente y más seguro para Frappe.
+#
+#  CAMBIOS v2 (auditoría de la v1):
+#   [C1] gen_pass(): eliminado 'tr | head' (SIGPIPE => exit 141 con pipefail).
+#   [C2] Logging activo desde la línea 1; los prompts van a /dev/tty.
+#   [C3] MariaDB idempotente: detecta si root ya usa password antes de tocar SQL.
+#   [C4] trim() en Bash puro: 'xargs' destruía comillas en la llave SSH.
+#   [C5] Credenciales fuera del log; archivo 0600 en /root.
+#   [C6] bench new-site: se sondean los flags con --help, sin reintentos ciegos.
+#   [C7] Puntos de control (checkpoints): reanudable sin repetir trabajo.
+#   [C8] wkhtmltopdf tolerante a fallos (el .deb jammy puede romperse en noble).
+#   [C9] apt con espera de lock y reintentos.
+#   [C10] Red de seguridad SSH: si el puerto nuevo no escucha, restaura acceso.
+# =============================================================================
 
 set -Eeuo pipefail
 
@@ -22,6 +206,30 @@ LOG_FILE="${VARDIR}/log/bashcore-frappe16.log"
 #  CONSTANTES
 # -----------------------------------------------------------------------------
 TIMEZONE="America/Managua"   # valor por defecto; la pregunta 6/10 lo cambia
+# ---------------------------------------------------------------------------
+#  MATRIZ DE COMPATIBILIDAD (verificada contra los repositorios de Frappe)
+#    campos: rama | python | node | mariadb | apps | SO compatibles
+#  Las versiones de Python y Node NO son preferencia: salen de lo que cada
+#  rama declara en su pyproject.toml y su package.json.
+# ---------------------------------------------------------------------------
+declare -A FV_RAMA=(   [16]="version-16" [15]="version-15" [14]="version-14" [13]="version-13" )
+declare -A FV_PYTHON=( [16]="3.14"      [15]="3.11"       [14]="3.10"       [13]="3.9" )
+declare -A FV_NODE=(   [16]="24"        [15]="20"         [14]="16"         [13]="14" )
+declare -A FV_DB=(     [16]="mariadb-11.8.8" [15]="mariadb-11.8.8" [14]="mariadb-10.6" [13]="mariadb-10.6" )
+declare -A FV_APPS=(   [16]="erpnext hrms lending wiki" [15]="erpnext hrms lending wiki"
+                       [14]="erpnext hrms wiki"         [13]="erpnext wiki" )
+# 'wiki' sólo tiene rama propia en la 13 y la 14; en la 15/16 va por master.
+declare -A FV_WIKI=(   [16]="master" [15]="master" [14]="version-14" [13]="version-13" )
+# Sistemas probados y sistemas tolerados (con aviso).
+declare -A FV_SO_OK=(  [16]="ubuntu-24.04"
+                       [15]="ubuntu-22.04 ubuntu-24.04"
+                       [14]="ubuntu-20.04 ubuntu-22.04"
+                       [13]="ubuntu-20.04 ubuntu-22.04" )
+declare -A FV_SO_AVISO=( [16]="ubuntu-26.04 debian-13"
+                         [15]="ubuntu-26.04 debian-12 debian-13"
+                         [14]="ubuntu-24.04 debian-12"
+                         [13]="ubuntu-18.04" )
+
 MARIADB_VERSION="mariadb-11.8.8"
 NVM_VERSION="v0.39.7"
 NODE_VERSION="24"
@@ -109,6 +317,24 @@ declare -A FONT_BLOQUE=(
 )
 
 _glifo() { printf '%s' "${FONT_BLOQUE[$1]:-${FONT_BLOQUE[' ']}}"; }
+
+# Igual que banner_empresa pero en texto plano, para archivos como
+# /etc/issue.net donde los códigos de color no siempre se interpretan.
+banner_empresa_texto() {
+  local nombre="${1:-}" i c fila glifo trozo
+  nombre="${nombre^^}"
+  (( ${#nombre} > 14 )) && nombre="${nombre:0:14}"
+  for fila in 1 2 3 4 5; do
+    trozo=""
+    for (( i=0; i<${#nombre}; i++ )); do
+      c="${nombre:i:1}"
+      glifo="$(_glifo "$c")"
+      trozo+="$(printf '%s' "$glifo" | cut -d'|' -f"$fila")"
+      trozo+=" "
+    done
+    printf '  %s\n' "${trozo//#/#}"
+  done
+}
 
 # Banner de la empresa en letras de bloque, con el mismo estilo que iZone.
 banner_empresa() {
@@ -207,36 +433,53 @@ pressure_report() {
 
 # [P4] Catálogo de pasos. El orden es el de ejecución y los identificadores
 # deben coincidir con los que emite la fase de usuario.
-PASOS_ID=(dep ssh db runtime
-          node bench uv init get_erpnext get_hrms get_lending get_wiki
-          site inst_erpnext inst_hrms inst_lending inst_wiki migrate build configs
-          prod web)
-PASOS_LABEL=("Dependencias del sistema"
-             "Hardening SSH + usuario"
-             "MariaDB y base de datos"
-             "Entorno de ejecución"
-             "Node 24 + Yarn"
-             "frappe-bench (pipx)"
-             "Python 3.14 (uv)"
-             "bench init: núcleo de Frappe"
-             "Descarga ERPNext"
-             "Descarga HRMS"
-             "Descarga Lending"
-             "Descarga Wiki"
-             "Creación del sitio"
-             "Instala ERPNext"
-             "Instala HRMS"
-             "Instala Lending"
-             "Instala Wiki"
-             "Migraciones"
-             "Compilación de assets"
-             "Configs Nginx/Supervisor"
-             "Pase a producción"
-             "Nginx + Supervisor")
-# Peso real de cada paso (suman 100) y duración típica en segundos: con esto
-# el porcentaje avanza proporcional al trabajo y se puede estimar lo que falta.
-PASOS_PESO=(3 2 5 5   4 3 3 20   5 3 3 2   4   8 5 4 3   3 8 1   4 2)
-PASOS_SEGS=(120 60 180 240   180 90 120 1500   300 180 180 120   180   420 300 240 180   180 600 30   240 60)
+# Los pasos se construyen según las aplicaciones que existan para la versión
+# elegida: la 13 tiene dos apps y la 16 cuatro, así que ni el número de pasos
+# ni los pesos pueden estar escritos a mano.
+PASOS_ID=(); PASOS_LABEL=(); PASOS_PESO=(); PASOS_SEGS=()
+
+construir_pasos() {
+  local apps="${APPS_DISPONIBLES:-erpnext hrms lending wiki}" a
+  PASOS_ID=();  PASOS_LABEL=();  PASOS_PESO=();  PASOS_SEGS=()
+  _paso() { PASOS_ID+=("$1"); PASOS_LABEL+=("$2"); PASOS_PESO+=("$3"); PASOS_SEGS+=("$4"); }
+
+  _paso dep     "Dependencias del sistema"        3 120
+  _paso ssh     "Hardening SSH + usuario"         2  60
+  _paso db      "MariaDB y base de datos"         5 180
+  _paso runtime "Entorno de ejecución"            5 240
+  _paso node    "Node ${NODE_VERSION} + Yarn"     4 180
+  _paso bench   "frappe-bench (pipx)"             3  90
+  _paso uv      "Python ${PYTHON_VERSION} (uv)"   3 120
+  _paso init    "bench init: núcleo de Frappe"   20 1500
+  for a in $apps; do
+    _paso "get_${a}"  "Descarga ${a^}"            3 180
+  done
+  _paso site    "Creación del sitio"              4 300
+  for a in $apps; do
+    _paso "inst_${a}" "Instala ${a^}"             5 300
+  done
+  _paso migrate "Migraciones"                     3 180
+  _paso build   "Compilación de assets"           8 600
+  _paso configs "Configs Nginx/Supervisor"        1  30
+  _paso prod    "Pase a producción"               4 240
+  _paso web     "Nginx + Supervisor"              2  60
+
+  # Los pesos deben sumar 100 para que la barra llegue justo al 100%.
+  local total=0 i
+  for i in "${PASOS_PESO[@]}"; do total=$(( total + i )); done
+  if (( total != 100 && total > 0 )); then
+    # Se ajusta proporcionalmente y el resto se acumula en 'bench init'.
+    local acum=0 nuevo_peso
+    for i in "${!PASOS_PESO[@]}"; do
+      nuevo_peso=$(( PASOS_PESO[i] * 100 / total ))
+      (( nuevo_peso < 1 )) && nuevo_peso=1
+      PASOS_PESO[i]=$nuevo_peso
+      acum=$(( acum + nuevo_peso ))
+    done
+    PASOS_PESO[7]=$(( PASOS_PESO[7] + 100 - acum ))
+  fi
+}
+
 PROGRESS_FILE="${STATE_DIR}/progress"
 
 # Lee TODO el archivo de progreso de una sola pasada, en Bash puro: sin
@@ -341,6 +584,22 @@ ultima_linea_log() {
   return 0
 }
 
+# Lo que está haciendo AHORA una fase de root. La descripción de la tarjeta
+# se alimentaba sólo del log de la fase de usuario, así que durante 'apt' o
+# MariaDB decía "trabajando" y las acciones se colaban como avisos aparte.
+ACTIVIDAD_FILE=""
+actividad() {
+  ACTIVIDAD_FILE="${STATE_DIR}/actividad"
+  printf '%s' "$*" > "$ACTIVIDAD_FILE" 2>/dev/null || true
+  return 0
+}
+actividad_actual() {
+  local a=""
+  [[ -r "${STATE_DIR}/actividad" ]] && a="$(cat "${STATE_DIR}/actividad" 2>/dev/null || true)"
+  printf '%s' "$a"
+  return 0
+}
+
 CARD_W=62
 CARD_LINES=0
 
@@ -374,6 +633,7 @@ render_card() {
     if (( pct >= 100 )); then fase="Despliegue completado"; else fase="Preparando el entorno"; fi
   fi
   desc="$(subtarea_actual 2>/dev/null || true)"
+  [[ -z "$desc" ]] && desc="$(actividad_actual 2>/dev/null || true)"
   [[ -z "$desc" ]] && desc="$(ultima_linea_log 2>/dev/null || true)"
   [[ -z "$desc" ]] && desc="trabajando"
 
@@ -757,6 +1017,406 @@ if [[ "$ACTION" == "reset" ]]; then
 fi
 
 # =============================================================================
+#  DIAGNÓSTICO
+# =============================================================================
+detectar_instalacion() {
+  # Localiza el bench y el usuario propietario sin depender del estado.
+  BENCH_DETECTADO=""; USER_DETECTADO=""; SITIO_DETECTADO=""
+  local d
+  for d in "${HOMEBASE}"/*/frappe-bench; do
+    [[ -d "$d/sites" ]] || continue
+    BENCH_DETECTADO="$d"
+    USER_DETECTADO="$(basename "$(dirname "$d")")"
+    break
+  done
+  [[ -n "$BENCH_DETECTADO" ]] || return 1
+  local sd
+  for sd in "$BENCH_DETECTADO"/sites/*/; do
+    [[ -f "${sd}site_config.json" ]] || continue
+    SITIO_DETECTADO="$(basename "$sd")"; break
+  done
+  return 0
+}
+
+# Submenú: se elige qué comprobar en lugar de volcarlo todo de golpe.
+menu_diagnostico() {
+  while :; do
+    say "\n  ${BOLD}¿Qué quieres diagnosticar?${NC}\n\n"
+    say "    ${BOLD}1${NC}) Todo (informe completo)\n"
+    say "    ${BOLD}2${NC}) Servicios del sistema (MariaDB, Redis, Nginx, Supervisor, SSH)\n"
+    say "    ${BOLD}3${NC}) Puertos a la escucha\n"
+    say "    ${BOLD}4${NC}) Instalación de Frappe (bench, sitio y aplicaciones)\n"
+    say "    ${BOLD}5${NC}) Respuesta del sitio por HTTP\n"
+    say "    ${BOLD}6${NC}) Procesos de Supervisor\n"
+    say "    ${BOLD}7${NC}) Errores recientes en los registros\n"
+    say "    ${BOLD}8${NC}) Recursos: memoria, disco e inodos\n"
+    say "    ${BOLD}9${NC}) Generar paquete de diagnóstico (.tar.gz)\n"
+    say "    ${BOLD}0${NC}) Volver al menú principal\n\n  > "
+    local op; read -r op || op=0
+    case "$(trim "${op}")" in
+      1) diagnostico todo ;;
+      2) diagnostico servicios ;;
+      3) diagnostico puertos ;;
+      4) diagnostico frappe ;;
+      5) diagnostico sitio ;;
+      6) diagnostico supervisor ;;
+      7) diagnostico errores ;;
+      8) diagnostico recursos ;;
+      9) generar_diag ;;
+      0) return 0 ;;
+      *) say "  ${RED}Opción no válida.${NC}\n" ;;
+    esac
+  done
+}
+
+diagnostico() {
+  local que="${1:-todo}" fallos=0
+  say "\n${BOLD}  DIAGNÓSTICO DEL SISTEMA${NC}\n\n"
+
+  chk() {  # descripción · comando
+    local d="$1"; shift
+    if "$@" >/dev/null 2>&1; then
+      say "    ${GREEN}[ OK ]${NC} ${d}\n"
+    else
+      say "    ${RED}[FALLA]${NC} ${d}\n"; fallos=$((fallos+1))
+    fi
+  }
+
+  if [[ "$que" == todo || "$que" == servicios ]]; then
+  say "  ${BOLD}Servicios${NC}\n"
+  local svc
+  for svc in mariadb redis-server nginx supervisor ssh; do
+    chk "$svc" systemctl is-active --quiet "$svc"
+  done
+
+  fi
+
+  if [[ "$que" == todo || "$que" == puertos ]]; then
+  say "\n  ${BOLD}Puertos a la escucha${NC}\n"
+  local p
+  for p in 80 3306; do
+    chk "puerto ${p}" bash -c "ss -H -tln | grep -q ':${p}[[:space:]]'"
+  done
+  local sshp
+  sshp="$(awk '/^Port /{print $2; exit}' "${ETC}/ssh/sshd_config.d/99-custom.conf" 2>/dev/null)"
+  [[ -n "${sshp:-}" ]] && chk "SSH en el puerto ${sshp}" bash -c "ss -H -tln | grep -q ':${sshp}[[:space:]]'"
+
+  fi
+
+  if [[ "$que" == todo || "$que" == frappe || "$que" == sitio ]]; then
+  say "\n  ${BOLD}Instalación de Frappe${NC}\n"
+  if detectar_instalacion; then
+    say "    ${GREEN}[ OK ]${NC} bench en ${BENCH_DETECTADO} (usuario ${USER_DETECTADO})\n"
+    if [[ -n "$SITIO_DETECTADO" ]]; then
+      say "    ${GREEN}[ OK ]${NC} sitio: ${SITIO_DETECTADO}\n"
+      say "\n  ${BOLD}Aplicaciones instaladas${NC}\n"
+      su - "$USER_DETECTADO" -c "cd '${BENCH_DETECTADO}' && bench --site '${SITIO_DETECTADO}' list-apps" 2>/dev/null \
+        | sed 's/^/      /' > /tmp/.bc_apps 2>/dev/null || true
+      if [[ -s /tmp/.bc_apps ]]; then
+        while IFS= read -r l; do say "${l}\n"; done < /tmp/.bc_apps
+      else
+        say "      ${YELLOW}(no se pudo consultar)${NC}\n"; fallos=$((fallos+1))
+      fi
+      rm -f /tmp/.bc_apps
+
+      say "\n  ${BOLD}Respuesta del sitio${NC}\n"
+      local codigo
+      codigo="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${SITIO_DETECTADO}" http://127.0.0.1/ 2>/dev/null || echo 000)"
+      if [[ "$codigo" =~ ^(200|302|303)$ ]]; then
+        say "    ${GREEN}[ OK ]${NC} HTTP ${codigo} en http://${SITIO_DETECTADO}/\n"
+      else
+        say "    ${RED}[FALLA]${NC} HTTP ${codigo}: el sitio no responde\n"; fallos=$((fallos+1))
+      fi
+    else
+      say "    ${RED}[FALLA]${NC} no se encontró ningún sitio creado\n"; fallos=$((fallos+1))
+    fi
+  else
+    say "    ${RED}[FALLA]${NC} no hay ninguna instalación de Frappe en ${HOMEBASE}\n"
+    fallos=$((fallos+1))
+  fi
+
+  fi
+
+  if [[ "$que" == todo || "$que" == supervisor ]]; then
+  say "\n  ${BOLD}Procesos de Supervisor${NC}\n"
+  if command -v supervisorctl >/dev/null 2>&1; then
+    supervisorctl status 2>/dev/null | sed 's/^/      /' > /tmp/.bc_sup || true
+    if [[ -s /tmp/.bc_sup ]]; then
+      while IFS= read -r l; do say "${l}\n"; done < /tmp/.bc_sup
+      grep -qv RUNNING /tmp/.bc_sup && fallos=$((fallos+1))
+    else
+      say "      ${YELLOW}(sin procesos registrados)${NC}\n"; fallos=$((fallos+1))
+    fi
+    rm -f /tmp/.bc_sup
+  fi
+
+  fi
+
+  if [[ "$que" == todo || "$que" == errores ]]; then
+  say "\n  ${BOLD}Errores recientes en los registros${NC}\n"
+  local encontrados=0 lf
+  if [[ -n "${BENCH_DETECTADO:-}" ]]; then
+    for lf in "$BENCH_DETECTADO"/logs/*.error.log "$BENCH_DETECTADO"/logs/*.log; do
+      [[ -f "$lf" ]] || continue
+      local n; n="$(grep -ciE 'traceback|error|exception' "$lf" 2>/dev/null || echo 0)"
+      if (( n > 0 )); then
+        say "    ${YELLOW}${n}${NC} coincidencias en $(basename "$lf")\n"
+        grep -iE 'traceback|error|exception' "$lf" 2>/dev/null | tail -2 | cut -c1-90 | sed 's/^/        /' > /tmp/.bc_err || true
+        while IFS= read -r l; do say "${l}\n"; done < /tmp/.bc_err
+        rm -f /tmp/.bc_err
+        encontrados=1
+      fi
+    done
+  fi
+  (( encontrados == 0 )) && say "    ${GREEN}sin errores relevantes${NC}\n"
+  fi
+
+  if [[ "$que" == todo || "$que" == recursos ]]; then
+    say "\n  ${BOLD}Recursos${NC}\n"
+    say "    memoria disponible: $(awk '/MemAvailable/{print int($2/1024)"MB"}' /proc/meminfo 2>/dev/null)"
+    say "   ·  swap: $(awk '/SwapTotal/{print int($2/1024)"MB"}' /proc/meminfo 2>/dev/null)\n"
+    say "    disco: $( { df -h / 2>/dev/null || true; } | tail -1 | awk '{print $4" libres de "$2}')\n"
+    say "    inodos: $( { df -i / 2>/dev/null || true; } | tail -1 | awk '{print $5" usados"}')\n"
+  fi
+
+  say "\n  ${BOLD}Resumen${NC}: "
+  if (( fallos == 0 )); then
+    say "${GREEN}todo correcto${NC}\n\n"
+  else
+    say "${RED}${fallos} comprobación(es) con problemas${NC}\n"
+    say "  Genera el paquete completo con: bash $0 --diag\n\n"
+  fi
+  return 0
+}
+
+generar_diag() {
+  say "\n  Generando el paquete de diagnóstico...\n"
+  bash "$0" --diag 2>/dev/null | sed 's/^/  /' > /tmp/.bc_dg || true
+  while IFS= read -r l; do say "${l}\n"; done < /tmp/.bc_dg
+  rm -f /tmp/.bc_dg
+  return 0
+}
+
+# =============================================================================
+#  DESINSTALACIÓN
+# =============================================================================
+desinstalar() {
+  say "\n${RED}${BOLD}  DESINSTALACIÓN COMPLETA${NC}\n\n"
+  detectar_instalacion || true
+  say "  Se eliminará TODO lo que instaló este script:\n\n"
+  say "    · Procesos y configuración de Supervisor\n"
+  say "    · Configuración de Nginx y sus cabeceras\n"
+  say "    · Bases de datos de Frappe y sus usuarios en MariaDB\n"
+  say "    · El directorio ${BENCH_DETECTADO:-<bench>} completo\n"
+  say "    · Paquetes: mariadb-server, redis, nginx, supervisor, wkhtmltopdf\n"
+  say "    · El repositorio de MariaDB y la configuración frappe.cnf\n"
+  say "    · La entrada del sitio en /etc/hosts y el banner de acceso\n"
+  say "    · El endurecimiento de SSH (vuelve al puerto 22 por defecto)\n"
+  say "    · Los permisos sudo y el estado del despliegue\n\n"
+  say "  ${YELLOW}El usuario del sistema y su home NO se borran por defecto:${NC}\n"
+  say "  ${YELLOW}pueden contener trabajo tuyo. Se pregunta aparte.${NC}\n\n"
+  say "  Escribe ${BOLD}DESINSTALAR${NC} para confirmar (cualquier otra cosa cancela): "
+  local c; read -r c || c=""
+  if [[ "$(trim "$c")" != "DESINSTALAR" ]]; then
+    say "\n  Cancelado. No se ha tocado nada.\n\n"; return 0
+  fi
+  say "\n"
+
+  paso_des() { say "    ${BLUE}·${NC} $*\n"; }
+
+  # 1. Detener y desregistrar los procesos
+  paso_des "Deteniendo Supervisor y Nginx"
+  supervisorctl stop all >/dev/null 2>&1 || true
+  rm -f "${ETC}/supervisor/conf.d/frappe-bench.conf" 2>/dev/null || true
+  supervisorctl reread >/dev/null 2>&1 || true
+  supervisorctl update >/dev/null 2>&1 || true
+  systemctl stop nginx supervisor >/dev/null 2>&1 || true
+
+  # 2. Configuración de Nginx
+  paso_des "Eliminando la configuración de Nginx"
+  rm -f "${ETC}/nginx/conf.d/frappe-bench.conf" \
+        "${ETC}/nginx/conf.d/00-bashcore-hardening.conf" 2>/dev/null || true
+  [[ -f "${ETC}/nginx/nginx.conf.bashcore.bak" ]] && \
+    mv "${ETC}/nginx/nginx.conf.bashcore.bak" "${ETC}/nginx/nginx.conf"
+
+  # 3. Bases de datos del sitio
+  paso_des "Eliminando bases de datos y usuarios de Frappe en MariaDB"
+  if [[ -n "${BENCH_DETECTADO:-}" && -n "${SITIO_DETECTADO:-}" ]]; then
+    local dbname
+    dbname="$(grep -oP '"db_name"\s*:\s*"\K[^"]+' \
+      "${BENCH_DETECTADO}/sites/${SITIO_DETECTADO}/site_config.json" 2>/dev/null || true)"
+    if [[ -n "${dbname:-}" ]]; then
+      say "      base de datos: ${dbname}\n"
+      say "      contraseña de root de MariaDB (Enter para omitir): "
+      local dbp; read -rs dbp; say "\n"
+      if [[ -n "$dbp" ]]; then
+        mariadb -u root -p"$dbp" -e "DROP DATABASE IF EXISTS \`${dbname}\`; DROP USER IF EXISTS '${dbname}'@'localhost'; FLUSH PRIVILEGES;" \
+          >/dev/null 2>&1 && say "      ${GREEN}eliminada${NC}\n" || say "      ${YELLOW}no se pudo eliminar${NC}\n"
+      fi
+    fi
+  fi
+
+  # 4. El bench completo
+  if [[ -n "${BENCH_DETECTADO:-}" && -d "$BENCH_DETECTADO" ]]; then
+    paso_des "Eliminando ${BENCH_DETECTADO}"
+    rm -rf "$BENCH_DETECTADO"
+  fi
+  rm -rf "${HOMEBASE}"/*/frappe-bench.roto-* "${HOMEBASE}"/*/frappe-bench.fallido-* 2>/dev/null || true
+
+  # 5. Paquetes y repositorios
+  paso_des "Desinstalando paquetes (MariaDB, Redis, Nginx, Supervisor, wkhtmltopdf)"
+  systemctl stop mariadb redis-server >/dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get purge -y \
+    mariadb-server mariadb-client redis-server nginx supervisor wkhtmltox \
+    >/dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get autoremove -y >/dev/null 2>&1 || true
+  rm -rf "${ETC}/mysql/mariadb.conf.d/frappe.cnf" "${ETC}/mysql/mariadb.conf.d/zz-lxc.cnf" \
+         "${VARDIR}/lib/mysql" "${ETC}/apt/sources.list.d/"mariadb* 2>/dev/null || true
+
+  # 6. Herramientas del usuario operativo
+  if [[ -n "${USER_DETECTADO:-}" ]]; then
+    paso_des "Eliminando bench, NVM y uv del usuario ${USER_DETECTADO}"
+    rm -rf "${HOMEBASE}/${USER_DETECTADO}/.nvm" \
+           "${HOMEBASE}/${USER_DETECTADO}/.local/share/pipx" \
+           "${HOMEBASE}/${USER_DETECTADO}/.local/share/uv" \
+           "${HOMEBASE}/${USER_DETECTADO}/.local/bin/bench" \
+           "${HOMEBASE}/${USER_DETECTADO}/.cache/yarn" 2>/dev/null || true
+    sed -i '/BASHCORE-ENV/,/\/BASHCORE-ENV/d' "${HOMEBASE}/${USER_DETECTADO}/.bashrc" 2>/dev/null || true
+  fi
+  rm -f /usr/local/bin/bench /usr/local/bin/node /usr/bin/node \
+        /usr/local/bin/npm /usr/local/bin/yarn 2>/dev/null || true
+
+  # 7. Reversión del endurecimiento de SSH
+  paso_des "Revirtiendo el endurecimiento de SSH (vuelve al puerto 22)"
+  rm -f "${ETC}/ssh/sshd_config.d/99-custom.conf" 2>/dev/null || true
+  if sshd -t 2>/dev/null; then
+    systemctl restart ssh >/dev/null 2>&1 || true
+    say "      ${GREEN}SSH restaurado${NC}\n"
+  else
+    say "      ${YELLOW}revisa la configuración de SSH antes de reiniciar${NC}\n"
+  fi
+
+  # 8. Rastros restantes
+  paso_des "Eliminando permisos sudo, banner, hosts, logs y estado"
+  rm -f "${ETC}/sudoers.d/99-bashcore-install" "${ETC}/sudoers.d/99-bashcore-frappe" 2>/dev/null || true
+  rm -f "${ETC}/tmpfiles.d/sshd-run.conf" "${ETC}/needrestart/conf.d/99-bashcore.conf" 2>/dev/null || true
+  [[ -n "${SITIO_DETECTADO:-}" ]] && sed -i "/[[:space:]]${SITIO_DETECTADO}\$/d" "${ETC}/hosts" 2>/dev/null || true
+  : > "${ETC}/issue.net" 2>/dev/null || true
+  rm -rf "${VARDIR}/lib/bashcore-frappe"* "${VARDIR}/lib/bashcore" 2>/dev/null || true
+  rm -f "${VARDIR}/log/bashcore-frappe"*.log* 2>/dev/null || true
+  rm -f "${ROOTDIR}/bashcore-credenciales-"*.txt 2>/dev/null || true
+
+  # 9. El usuario, sólo si se pide expresamente
+  if [[ -n "${USER_DETECTADO:-}" ]] && id "$USER_DETECTADO" &>/dev/null; then
+    say "\n  ¿Eliminar también el usuario '${USER_DETECTADO}' y su carpeta personal?\n"
+    if ask_yn "  Se perderá todo lo que haya dentro" n; then
+      pkill -u "$USER_DETECTADO" 2>/dev/null || true
+      sleep 2
+      userdel -r "$USER_DETECTADO" 2>/dev/null && say "      ${GREEN}usuario eliminado${NC}\n" \
+        || say "      ${YELLOW}no se pudo eliminar${NC}\n"
+    else
+      say "      usuario conservado\n"
+    fi
+  fi
+
+  say "\n  ${GREEN}${BOLD}Desinstalación terminada.${NC}\n"
+  say "  El sistema queda como antes del despliegue.\n"
+  say "  ${YELLOW}Recuerda:${NC} SSH ha vuelto al puerto 22.\n\n"
+  return 0
+}
+
+# =============================================================================
+#  MENÚ PRINCIPAL
+# =============================================================================
+so_actual() {
+  local id ver
+  id="$( . /etc/os-release 2>/dev/null; printf '%s' "${ID:-desconocido}" )"
+  ver="$( . /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-0}" )"
+  printf '%s-%s' "$id" "$ver"
+}
+
+# Aplica a las constantes globales la versión de Frappe elegida.
+aplicar_version() {
+  local v="$1"
+  FRAPPE_VER="$v"
+  FRAPPE_BRANCH="${FV_RAMA[$v]}"
+  PYTHON_VERSION="${FV_PYTHON[$v]}"
+  NODE_VERSION="${FV_NODE[$v]}"
+  MARIADB_VERSION="${FV_DB[$v]}"
+  APPS_DISPONIBLES="${FV_APPS[$v]}"
+  WIKI_BRANCH="${FV_WIKI[$v]}"
+  STATE_DIR="${VARDIR}/lib/bashcore-frappe${v}"
+  LOG_FILE="${VARDIR}/log/bashcore-frappe${v}.log"
+  PROGRESS_FILE="${STATE_DIR}/progress"
+  construir_pasos
+}
+
+# Comprueba el sistema operativo REAL contra la matriz de la versión elegida.
+validar_so() {
+  local v="$1" so; so="$(so_actual)"
+  say "\n  Sistema detectado: ${BOLD}${so}${NC}\n"
+  say "  Frappe ${v} · probado en: ${FV_SO_OK[$v]}\n"
+  [[ -n "${FV_SO_AVISO[$v]:-}" ]] && say "                 · tolerado en: ${FV_SO_AVISO[$v]}\n"
+  case " ${FV_SO_OK[$v]} " in
+    *" ${so} "*) say "  ${GREEN}COMPATIBLE${NC}: combinación probada.\n\n"; return 0 ;;
+  esac
+  case " ${FV_SO_AVISO[$v]:-} " in
+    *" ${so} "*)
+      say "  ${YELLOW}NO VALIDADO${NC}: debería funcionar, pero no está probado.\n"
+      if ask_yn "¿Continuar de todas formas?" n; then say "\n"; return 0; fi
+      return 1 ;;
+  esac
+  say "  ${RED}INCOMPATIBLE${NC}: Frappe ${v} no se instala en ${so}.\n"
+  local otra
+  for otra in 16 15 14 13; do
+    case " ${FV_SO_OK[$otra]} ${FV_SO_AVISO[$otra]:-} " in
+      *" ${so} "*) say "  En este sistema sí puedes instalar ${BOLD}Frappe ${otra}${NC}.\n" ;;
+    esac
+  done
+  say "\n"
+  return 1
+}
+
+menu_version() {
+  while :; do
+    say "\n  ${BOLD}¿Qué versión de Frappe quieres instalar?${NC}\n\n"
+    say "    ${BOLD}1${NC}) Frappe 16  · Python 3.14 · Node 24 · ERPNext, HRMS, Lending, Wiki\n"
+    say "    ${BOLD}2${NC}) Frappe 15  · Python 3.11 · Node 20 · ERPNext, HRMS, Lending, Wiki\n"
+    say "    ${BOLD}3${NC}) Frappe 14  · Python 3.10 · Node 16 · ERPNext, HRMS, Wiki\n"
+    say "    ${BOLD}4${NC}) Frappe 13  · Python 3.9  · Node 14 · ERPNext, Wiki\n"
+    say "    ${BOLD}0${NC}) Volver\n\n  > "
+    local op; read -r op || op=0
+    case "$(trim "${op}")" in
+      1) aplicar_version 16 ;;
+      2) aplicar_version 15 ;;
+      3) aplicar_version 14 ;;
+      4) aplicar_version 13 ;;
+      0) return 1 ;;
+      *) say "  ${RED}Opción no válida.${NC}\n"; continue ;;
+    esac
+    if validar_so "$FRAPPE_VER"; then return 0; fi
+  done
+}
+
+menu_principal() {
+  while :; do
+    say "\n  ${BOLD}¿Qué quieres hacer?${NC}\n\n"
+    say "    ${BOLD}1${NC}) Instalar      · despliegue limpio con hardening CIS\n"
+    say "    ${BOLD}2${NC}) Diagnóstico   · estado de servicios, sitio y errores\n"
+    say "    ${BOLD}3${NC}) Desinstalar   · eliminar todo y dejar el sistema como estaba\n"
+    say "    ${BOLD}4${NC}) Salir\n\n  > "
+    local op; read -r op || op=4
+    case "$(trim "${op}")" in
+      1) if menu_version; then return 0; fi ;;   # continúa a la instalación
+      2) menu_diagnostico ;;          # vuelve al menú al terminar
+      3) desinstalar ;;               # vuelve al menú al terminar
+      4) say "\n  Hasta luego.\n\n"; exit 0 ;;
+      *) say "  ${RED}Opción no válida.${NC}\n" ;;
+    esac
+  done
+}
+
+# =============================================================================
 #  FASE 0: VERIFICACIONES PREVIAS
 # =============================================================================
 if [[ -z "$BC_PREFIX" && "${EUID}" -ne 0 ]]; then
@@ -796,10 +1456,10 @@ say "
 \033[0;36m\033[1m  ╚═╝\033[0m╚══════╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝
 \033[1m       E N T E R P R I S E\033[0m
         Frappe 16 · ERPNext · HRMS · Lending · Wiki
-        Ubuntu 24.04 LTS · CIS Hardening · v21.0
+        Ubuntu 24.04 LTS · CIS Hardening · v1.0.0
 
 "
-echo -e "\n### iZone bashcore-frappe16 v21.0 | Inicio: $(date -Is) | PID $$ ###"
+echo -e "\n### iZone install_frappe16 v1.0.0 | Inicio: $(date -Is) | PID $$ ###"
 [[ -n "$BC_PREFIX" ]] && warn "MODO PRUEBAS: todas las rutas bajo ${BC_PREFIX}"
 
 phase "FASE 0: VERIFICACIONES PREVIAS"
@@ -908,6 +1568,14 @@ if [[ -n "$DISK_FREE_GB" ]] && (( DISK_FREE_GB < 15 )); then
 else
   ok "Disco libre: ${DISK_FREE_GB:-?}GB"
 fi
+
+# =============================================================================
+#  ELECCIÓN DE ACCIÓN
+# =============================================================================
+# El menú se repite hasta que se elija instalar o salir: diagnóstico y
+# desinstalación regresan a él en lugar de terminar el programa.
+menu_principal
+ok "Se instalará Frappe ${FRAPPE_VER} (${FRAPPE_BRANCH})."
 
 # =============================================================================
 #  LAS 10 PREGUNTAS  (único tramo interactivo)
@@ -1225,6 +1893,10 @@ CONFIRM="${CONFIRM^^}"
 case "$CONFIRM" in
   LISTO)
     ok "Confirmado. Comienza el despliegue."
+    # El detalle va sólo al log: sin este aviso, la pantalla parecería muerta
+    # durante los primeros minutos de 'apt'.
+    say "\n  Iniciando. El detalle completo queda en ${LOG_FILE}\n"
+    say "  En pantalla verás sólo la barra de progreso y los avisos.\n\n"
     break ;;
   SALIR|EXIT|CANCELAR|Q)
     warn "Operación cancelada. No se ha modificado nada."
@@ -1238,7 +1910,25 @@ esac
 echo "### Confirmado. Despliegue desatendido iniciado: $(date -Is) ###"
 
 
+
+
 done
+
+# Latido: repinta la tarjeta cada 3 s durante todo el despliegue, incluidas
+# las fases largas de root (apt, MariaDB), para que nunca parezca detenido.
+INICIO_GLOBAL="$(date +%s)"
+TICKER_PID=""
+ticker_on() {
+  (( HAVE_TTY == 1 )) || return 0
+  ( while :; do
+      render_card $(( ($(date +%s) - INICIO_GLOBAL) / 60 ))
+      sleep 3
+    done ) &
+  TICKER_PID=$!
+}
+ticker_off() { [[ -n "${TICKER_PID:-}" ]] && kill "$TICKER_PID" 2>/dev/null; TICKER_PID=""; }
+trap 'ticker_off' EXIT
+ticker_on
 
 # --- [F5] Dependencias: se listan las que faltan y se pide confirmación ----
 # Herramientas sin las que el script no puede trabajar. Formato "comando:paquete".
@@ -1263,15 +1953,18 @@ if (( ${#MISSING_CMDS[@]} == 0 )); then
   ok "Dependencias básicas presentes (${#DEPS[@]} comprobadas)."
 else
   # [Z2] Sin preguntas: se instalan y se informa de cada paso.
-  warn "Faltan estas herramientas: ${MISSING_CMDS[*]}"
+  info "Faltan estas herramientas: ${MISSING_CMDS[*]}"
   info "Instalando automáticamente: ${MISSING_PKGS[*]}"
+  actividad "instalando ${MISSING_PKGS[*]}"
   if ! command -v apt-get >/dev/null 2>&1; then
     fail "No existe apt-get: este script requiere Debian/Ubuntu."
     exit 1
   fi
   info "  paso 1/2 · actualizando el índice de paquetes (apt-get update)"
+  actividad "actualizando el índice de paquetes"
   apt_do update
   info "  paso 2/2 · instalando ${#MISSING_PKGS[@]} paquete(s)"
+  actividad "instalando ${MISSING_PKGS[*]}"
   apt_do install -y "${MISSING_PKGS[@]}"
   STILL=()
   for dcmd in "${MISSING_CMDS[@]}"; do
@@ -1286,6 +1979,7 @@ else
 fi
 
 # --- [Z4] Red y ramas: se comprueba ANTES de invertir 20 minutos -----------
+actividad "verificando el acceso a GitHub"
 info "Comprobando acceso a GitHub y existencia de las ramas..."
 RAMAS_MAL=""
 if command -v git >/dev/null 2>&1; then
@@ -1365,21 +2059,6 @@ exec 0</dev/null
 export GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true SSH_ASKPASS=/bin/true
 export SUDO_ASKPASS=/bin/false PIP_NO_INPUT=1 CI=1
 
-# Latido: repinta la tarjeta cada 3 s durante todo el despliegue, incluidas
-# las fases largas de root (apt, MariaDB), para que nunca parezca detenido.
-INICIO_GLOBAL="$(date +%s)"
-TICKER_PID=""
-ticker_on() {
-  (( HAVE_TTY == 1 )) || return 0
-  ( while :; do
-      render_card $(( ($(date +%s) - INICIO_GLOBAL) / 60 ))
-      sleep 3
-    done ) &
-  TICKER_PID=$!
-}
-ticker_off() { [[ -n "${TICKER_PID:-}" ]] && kill "$TICKER_PID" 2>/dev/null; TICKER_PID=""; }
-trap 'ticker_off' EXIT
-ticker_on
 mkdir -p "${ETC}/needrestart/conf.d"
 echo '$nrconf{restart} = "a";' > "${ETC}/needrestart/conf.d/99-bashcore.conf"
 
@@ -1387,6 +2066,7 @@ echo '$nrconf{restart} = "a";' > "${ETC}/needrestart/conf.d/99-bashcore.conf"
 #  FASE 1: HARDENING DEL SISTEMA OPERATIVO  (CIS 1.9, 5.2)
 # =============================================================================
 avance ssh RUN
+actividad "endureciendo el sistema y SSH"
 phase "FASE 1: HARDENING DEL SISTEMA OPERATIVO"
 
 if is_done fase1_update; then
@@ -1630,7 +2310,13 @@ Banner /etc/issue.net
 SSHCONF
   chmod 600 "${ETC}/ssh/sshd_config.d/99-custom.conf"
 
-  cat > "${ETC}/issue.net" <<'BANNER'
+  # El banner de la empresa se pinta también en /etc/issue.net, que es lo
+  # que ve cualquiera al conectarse por SSH antes de autenticarse.
+  {
+    printf '\n'
+    banner_empresa_texto "$EMPRESA"
+    cat <<'BANNER'
+
 ***************************************************************************
                           ACCESO RESTRINGIDO
   Sistema de uso exclusivo para personal autorizado. Toda actividad es
@@ -1638,6 +2324,7 @@ SSHCONF
   conforme a la legislación vigente.
 ***************************************************************************
 BANNER
+  } > "${ETC}/issue.net"
   chmod 644 "${ETC}/issue.net"
   ok "Configuración y banner escritos."
 
@@ -1698,7 +2385,7 @@ BANNER
       warn "Configura el firewall en el sistema anfitrión."
     fi
   elif (( IS_CT )); then
-    warn "Sin UFW activo: abre tcp/${SSH_PORT}, tcp/80 y tcp/443 en el anfitrión."
+    info "Sin UFW activo: abre tcp/${SSH_PORT}, tcp/80 y tcp/443 en el anfitrión."
   else
     warn "UFW inactivo. Abre el puerto ${SSH_PORT} en el firewall del proveedor."
   fi
@@ -1729,6 +2416,7 @@ avance db RUN
 # =============================================================================
 #  FASE 2: CAPA DE DATOS (MARIADB)  (CIS 2.9, 4.x, 8.1)
 # =============================================================================
+actividad "instalando y asegurando MariaDB"
 phase "FASE 2: CAPA DE DATOS (${MARIADB_VERSION})"
 
 if is_done fase2_install; then
@@ -1737,14 +2425,54 @@ else
   info "Instalando prerequisitos del repositorio..."
   apt_do install -y curl software-properties-common apt-transport-https ca-certificates
 
-  if ls "${ETC}/apt/sources.list.d/"mariadb* >/dev/null 2>&1; then
-    info "Repositorio de MariaDB ya configurado."
+  # --- Repositorio de MariaDB -------------------------------------------
+  # El instalador oficial añade TRES repositorios: mariadb-server, maxscale
+  # y tools. Frappe sólo necesita el primero, pero si maxscale no publica
+  # para esta versión de Ubuntu devuelve 404 y 'apt update' falla ENTERO,
+  # abortando el despliegue por un repositorio que no usamos.
+  CODENAME="$( . /etc/os-release 2>/dev/null; printf '%s' "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}" )"
+
+  repo_mariadb_ok() {
+    # ¿El repositorio responde para esta distribución? Se comprueba de verdad.
+    apt_do update >/dev/null 2>&1
+  }
+
+  configurar_repo_mariadb() {  # $1 = codename a forzar (vacío = automático)
+    local forzado="${1:-}"
+    rm -f "${ETC}/apt/sources.list.d/"mariadb* 2>/dev/null || true
+    local args=(--mariadb-server-version="${MARIADB_VERSION}" --skip-maxscale --skip-tools)
+    if [[ -n "$forzado" ]]; then
+      args+=(--os-type=ubuntu --os-version="$forzado")
+    fi
+    curl -LsS https://r.mariadb.com/downloads/mariadb_repo_setup | bash -s -- "${args[@]}" \
+      >/dev/null 2>&1 || return 1
+    # Por si alguna versión del instalador ignora --skip-maxscale.
+    grep -rl 'maxscale' "${ETC}/apt/sources.list.d/" 2>/dev/null | xargs -r rm -f
+    return 0
+  }
+
+  actividad "configurando el repositorio de MariaDB"
+  info "Configurando el repositorio de MariaDB para '${CODENAME:-desconocido}'..."
+  REPO_LISTO=0
+  if configurar_repo_mariadb "" && repo_mariadb_ok; then
+    ok "Repositorio de MariaDB operativo para ${CODENAME:-esta versión}."
+    REPO_LISTO=1
   else
-    info "Configurando el repositorio oficial de MariaDB..."
-    curl -LsS https://r.mariadb.com/downloads/mariadb_repo_setup \
-      | bash -s -- --mariadb-server-version="${MARIADB_VERSION}"
-    apt_do update
-    ok "Repositorio configurado."
+    # Ubuntu recién salido: MariaDB aún no publica para su nombre en clave.
+    # Se usa el de la última LTS soportada, compatible a nivel binario.
+    warn "MariaDB todavía no publica paquetes para '${CODENAME}'."
+    warn "Se usará el repositorio de Ubuntu 24.04 (noble), compatible."
+    warn "Cuando MariaDB publique para '${CODENAME}', este script lo usará solo."
+    if configurar_repo_mariadb noble && repo_mariadb_ok; then
+      ok "Repositorio de MariaDB operativo (compatibilidad noble)."
+      REPO_LISTO=1
+    fi
+  fi
+  if (( REPO_LISTO == 0 )); then
+    warn "No se pudo configurar el repositorio de MariaDB."
+    warn "Se usará la versión incluida en la distribución."
+    rm -f "${ETC}/apt/sources.list.d/"mariadb* 2>/dev/null || true
+    apt_do update || true
   fi
 
   info "Instalando servidor, cliente y librerías de desarrollo..."
@@ -1991,6 +2719,7 @@ avance runtime RUN
 # =============================================================================
 #  FASE 3: ENTORNO DE EJECUCIÓN (dependencias globales)
 # =============================================================================
+actividad "instalando dependencias del entorno"
 phase "FASE 3: ENTORNO DE EJECUCIÓN"
 
 if is_done fase3_deps; then
@@ -2072,19 +2801,39 @@ phase "CAMBIO DE CONTEXTO: root -> ${NEW_USER}"
 # permiso mínimo (sólo lo que Frappe necesita para gestionar sus servicios).
 SUDOERS_INSTALL="${ETC}/sudoers.d/99-bashcore-install"
 mkdir -p "${ETC}/sudoers.d"
-cat > "$SUDOERS_INSTALL" <<SUDOEOF
-# Temporal: creado por bashcore-frappe16 durante la instalación.
-# Se sustituye por un permiso mínimo al finalizar el despliegue.
-${NEW_USER} ALL=(ALL) NOPASSWD: ALL
-Defaults:${NEW_USER} !requiretty
-SUDOEOF
-chmod 440 "$SUDOERS_INSTALL"
-if command -v visudo >/dev/null 2>&1 && ! visudo -cf "$SUDOERS_INSTALL" >/dev/null 2>&1; then
+
+# Ubuntu 25.10+ trae 'sudo-rs', una reimplementación con gramática reducida
+# que rechaza directivas como 'Defaults:usuario !requiretty'. Se prueban tres
+# formas, de la más completa a la más simple, y se conserva la primera que el
+# propio visudo acepte.
+sudoers_valido() {
+  command -v visudo >/dev/null 2>&1 || return 0   # sin visudo no hay validación
+  visudo -cf "$1" >/dev/null 2>&1
+}
+
+SUDOERS_OK=0
+for _intento in 1 2 3; do
+  case "$_intento" in
+    1) printf '# Temporal: creado por bashcore durante la instalación.\n%s ALL=(ALL) NOPASSWD: ALL\nDefaults:%s !requiretty\n' "$NEW_USER" "$NEW_USER" > "$SUDOERS_INSTALL" ;;
+    2) printf '# Temporal: creado por bashcore durante la instalación.\n%s ALL=(ALL) NOPASSWD: ALL\n' "$NEW_USER" > "$SUDOERS_INSTALL" ;;
+    3) printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$NEW_USER" > "$SUDOERS_INSTALL" ;;
+  esac
+  chmod 440 "$SUDOERS_INSTALL"
+  if sudoers_valido "$SUDOERS_INSTALL"; then SUDOERS_OK=1; break; fi
+done
+
+if (( SUDOERS_OK == 1 )); then
+  ok "Permisos temporales de sudo concedidos a '${NEW_USER}' (sin contraseña)."
+else
+  # Antes esto ABORTABA el despliegue. Es una red de seguridad, no un
+  # requisito: el socket de Supervisor ya evita que bench necesite sudo y,
+  # al no haber terminal, cualquier sudo suelto falla al instante en vez de
+  # bloquear. Se avisa y se continúa.
   rm -f "$SUDOERS_INSTALL"
-  fail "El archivo sudoers generado no es válido; se elimina por seguridad."
-  exit 1
+  warn "Este sistema no aceptó el archivo sudoers (probablemente sudo-rs)."
+  warn "Se continúa sin él: si algún paso necesitara sudo, fallará con un"
+  warn "mensaje claro en lugar de quedarse esperando una contraseña."
 fi
-ok "Permisos temporales de sudo concedidos a '${NEW_USER}' (sin contraseña)."
 
 
 ENV_FILE="${USER_HOME}/.bashcore.env"
@@ -2101,6 +2850,8 @@ NODE_VERSION='${NODE_VERSION}'
 PYTHON_VERSION='${PYTHON_VERSION}'
 FRAPPE_BRANCH='${FRAPPE_BRANCH}'
 APPS_SEL='${APPS_SEL}'
+WIKI_BRANCH='${WIKI_BRANCH}'
+APPS_DISPONIBLES='${APPS_DISPONIBLES}'
 IS_CT='${IS_CT}'
 NODE_OPTS='${NODE_OPTS}'
 LANG='${LANG}'
@@ -2506,10 +3257,10 @@ get_app() {
 # Sólo las aplicaciones que eligió el operador en la pregunta 10/10.
 APPS_SEL="${APPS_SEL:-erpnext hrms lending wiki}"
 info "Aplicaciones seleccionadas: ${APPS_SEL:-(ninguna)}"
-for _app in erpnext hrms lending wiki; do
+for _app in ${APPS_DISPONIBLES:-erpnext hrms lending wiki}; do
   case " ${APPS_SEL} " in
     *" ${_app} "*)
-      if [[ "$_app" == "wiki" ]]; then get_app wiki master
+      if [[ "$_app" == "wiki" ]]; then get_app wiki "${WIKI_BRANCH:-master}"
       else get_app "$_app" "${FRAPPE_BRANCH}"; fi ;;
     *)
       # NA = no aplicable: no se descarga y no penaliza el progreso.
@@ -2639,7 +3390,7 @@ install_app() {
   fi
 }
 
-for _app in erpnext hrms lending wiki; do
+for _app in ${APPS_DISPONIBLES:-erpnext hrms lending wiki}; do
   case " ${APPS_SEL} " in
     *" ${_app} "*) install_app "$_app" ;;
   esac
@@ -2938,6 +3689,7 @@ fi
 #  FASE 7: PASE A PRODUCCIÓN Y SEGURIDAD WEB  (CIS NGINX v3.0.0)
 # =============================================================================
 avance prod RUN
+actividad "pase a producción (Nginx y Supervisor)"
 phase "FASE 7: PASE A PRODUCCIÓN"
 
 if is_done fase7_ansible; then
@@ -3218,6 +3970,15 @@ fi
 chmod 600 "$CRED_FILE"
 
 mark_done completo
+
+# El latido vive en un subshell: su última pasada puede haber quedado varios
+# minutos atrás (por eso la barra se quedaba en el 94%). Se detiene y se pinta
+# una tarjeta final desde este shell, con el estado real y definitivo.
+ticker_off
+actividad "despliegue finalizado"
+CARD_LINES=0
+render_card $(( ($(date +%s) - INICIO_GLOBAL) / 60 ))
+say "\n"
 
 # =============================================================================
 #  RESUMEN  ([C5] las contraseñas salen SOLO a la terminal, nunca al log)
