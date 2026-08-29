@@ -6,7 +6,7 @@
 ![Bash](https://img.shields.io/badge/Script-Bash-4EAA25?style=for-the-badge&logo=gnu-bash)
 ![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)
 
-**Bashcore-Frappe** es un aprovisionador automatizado escrito en Bash que te permite instalar, configurar y desplegar cualquier versión del framework Frappe (desde la versión 13 hasta la 16) de forma interactiva y segura. 
+**Frappe-setup** es un aprovisionador automatizado escrito en Bash que te permite instalar, configurar y desplegar cualquier versión del framework Frappe (desde la versión 13 hasta la 16) de forma interactiva y segura. 
 
 Destaca por su compatibilidad nativa para instalar **Frappe 16 sobre Ubuntu 26.04 LTS**, aplicando desde el primer momento un endurecimiento de seguridad (hardening) basado en los estándares CIS.
 
@@ -17,4 +17,4 @@ Destaca por su compatibilidad nativa para instalar **Frappe 16 sobre Ubuntu 26.0
 En un servidor Ubuntu recién instalado, accede como `root` y ejecuta el script principal. Puedes descargar y lanzar el instalador en un solo paso:
 
 ```bash
-wget -qO bashcore-frappe.sh [https://github.com/izone-ni/bashcore-frappe/releases/latest/download/bashcore-frappe.sh]
+wget -qO frappe-setup.sh https://github.com/izone-ni/frappe-scripts/releases/latest/download/frappe-setup.sh && sudo bash frappe-setup.sh
