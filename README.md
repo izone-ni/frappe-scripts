@@ -1,55 +1,20 @@
-# frappe-scripts
+# Frappe-setup
+**Scripts de aprovisionamiento universal para infraestructura Frappe.**
 
-Scripts de aprovisionamiento para infraestructura Frappe.
+![Frappe Versions](https://img.shields.io/badge/Frappe-v13%20|%20v14%20|%20v15%20|%20v16-blue?style=for-the-badge&logo=frappe)
+![OS Compatibility](https://img.shields.io/badge/Ubuntu-18.04%20|%2024.04%20|%2026.04-E95420?style=for-the-badge&logo=ubuntu)
+![Bash](https://img.shields.io/badge/Script-Bash-4EAA25?style=for-the-badge&logo=gnu-bash)
+![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)
 
-## install_frappe16.sh
+**Bashcore-Frappe** es un aprovisionador automatizado escrito en Bash que te permite instalar, configurar y desplegar cualquier versión del framework Frappe (desde la versión 13 hasta la 16) de forma interactiva y segura. 
 
-Aprovisionador automatizado de **Frappe 16 / ERPNext** sobre **Ubuntu 24.04 LTS**,
-con hardening de seguridad según el benchmark CIS.
+Destaca por su compatibilidad nativa para instalar **Frappe 16 sobre Ubuntu 26.04 LTS**, aplicando desde el primer momento un endurecimiento de seguridad (hardening) basado en los estándares CIS.
 
-### Uso
+---
 
-En un servidor Ubuntu 24.04 recién instalado, ejecutar como root:
+## Uso Rápido
+
+En un servidor Ubuntu recién instalado, accede como `root` y ejecuta el script principal. Puedes descargar y lanzar el instalador en un solo paso:
 
 ```bash
-wget -qO install_frappe16.sh https://github.com/izone-ni/frappe-scripts/releases/latest/download/install_frappe16.sh && sudo bash install_frappe16.sh
-```
-o
-```bash
-wget -qO install_frappe16_main.sh https://github.com/izone-ni/frappe-scripts/releases/latest/download/install_frappe16_main.sh && sudo bash install_frappe16_main.sh
-```
-
-El script pedirá al inicio los datos de configuración (usuario, puerto SSH,
-contraseñas, llave SSH, nombre del sitio). A partir de ahí, corre de forma
-totalmente automatizada.
-
-### Qué instala y configura
-
-- **Base de datos:** MariaDB 11.8.8 con hardening CIS
-- **Runtime:** Node.js 24, Python 3.14, Redis
-- **Framework:** Frappe 16 (bench)
-- **Aplicaciones:** ERPNext, HRMS, Lending (Versión 16)
-- **Servidor web:** Nginx + Supervisor (modo producción)
-
-### Hardening de seguridad aplicado
-
-- Autenticación SSH solo por llave (sin contraseñas)
-- Puerto SSH personalizado (default 44004)
-- Bloqueo de login de root
-- Firewall UFW (solo SSH, HTTP y HTTPS)
-- Banners de acceso restringido
-- Archivo swap automático si la RAM es menor a 8 GB
-
-### Requisitos
-
-- Ubuntu 24.04 LTS (Server o Desktop)
-- Acceso root
-- Conexión a internet durante la instalación
-- Una llave pública SSH del operador
-
-### Notas
-
-- El script se ejecuta en dos fases (configuración como root, luego instalación
-  como usuario operativo) de forma automática.
-- Al finalizar muestra un reporte de auditoría del estado de todos los servicios.
-- Duración estimada: +10 minutos según la velocidad de la red.
+wget -qO bashcore-frappe.sh [https://github.com/izone-ni/bashcore-frappe/releases/latest/download/bashcore-frappe.sh]
