@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v2.0.0  (unificado)
+#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v2.3.0  (unificado)
 #  https://github.com/izone-ni/frappe-scripts
 #  Despliegue automatizado + hardening de Frappe 16 / ERPNext 16
 #  Base: Ubuntu 24.04 LTS   Refs: CIS Ubuntu 24.04 v1.0.0, CIS NGINX v3.0.0
@@ -15,6 +15,94 @@
 #  El script detecta el entorno y se adapta. En un CT hay operaciones que el
 #  kernel del host NO delega al contenedor; se detallan en 'AJUSTES EN EL
 #  NODO PROXMOX' al final de esta cabecera.
+#
+#  CAMBIOS v2.3.0 (nginx habilitado pero incapaz de arrancar):
+#   SÍNTOMA: tras habilitar nginx seguía sin escuchar en el 80. 'nginx -t':
+#       [emerg] "server_tokens" directive is duplicate in
+#               /etc/nginx/conf.d/00-bashcore-hardening.conf:6
+#   El navegador da el MISMO ERR_CONNECTION_REFUSED que cuando el servicio no
+#   estaba habilitado, así que es fácil creer que el arreglo anterior falló.
+#   Son dos fallos distintos con el mismo síntoma: uno impedía que nginx
+#   arrancara SOLO, este impide que arranque en absoluto.
+#
+#   CAUSA: la Fase 7.3 tiene dos caminos para el hardening — inyectarlo dentro
+#   de nginx.conf, o escribir conf.d/00-bashcore-hardening.conf. Un despliegue
+#   que pasó por una versión con el primero y luego por otra con el segundo
+#   acaba con 'server_tokens' definido DOS VECES en el mismo contexto http.
+#   Y a diferencia de 'log_format main', que sí se comprobaba antes de
+#   escribirlo, 'server_tokens' se escribía siempre a ciegas.
+#
+#   [N1] 'server_tokens' sale del heredoc: ahora se añade sólo si nadie lo ha
+#        definido ya, con la misma comprobación que 'log_format main'.
+#   [N2] Antes de escribir el snippet de conf.d se retira el bloque
+#        BASHCORE-HARDENING incrustado en nginx.conf (copia en
+#        nginx.conf.antes-de-limpiar). Tener los dos es el origen del choque.
+#   [N3] '--reparar' incluye un saneador: lee el error de 'nginx -t', localiza
+#        la directiva duplicada y la comenta —incluidas las que ocupan varias
+#        líneas—, repitiendo hasta que la configuración valide. Sólo toca
+#        archivos creados por este script; ante configuración ajena se detiene
+#        y lo dice, en vez de estropear algo que no es suyo.
+#
+#  CAMBIOS v2.2.0 (el script diagnosticaba pero no reparaba):
+#   [P1] Nueva acción '--reparar' y opción 3 del menú: arregla el arranque de
+#        un despliegue YA instalado sin hacer las 10 preguntas, sin apt y sin
+#        tocar MariaDB, el sitio ni el sudoers. Idempotente.
+#        MOTIVO: relanzar el instalador para aplicar la FASE 7.5 obligaba a
+#        recontestar las 10 preguntas, y la línea 2677
+#            if is_done fase2_secure && db_try socket-pass && db_try tcp-pass
+#        revalida la contraseña de root de MariaDB: si no coincide con la del
+#        despliegue original, el script muere en la Fase 2 y NUNCA llega a la
+#        FASE 7.5. Se contestaban diez preguntas para no arreglar nada.
+#   [P2] BUG "HTTP 000000": curl con -w '%{http_code}' YA imprime '000' cuando
+#        no conecta, y ADEMÁS sale con código != 0, así que el '|| echo 000'
+#        concatenaba un segundo 000. Afectaba al diagnóstico y a la validación
+#        final. Se recorta a 3 caracteres.
+#   [P3] Paquete '--diag' de 512 bytes sin que nada avisara: 'du -h' informa
+#        BLOQUES EN DISCO, no bytes. Ahora se imprime el tamaño real con
+#        'stat -c %s', un manifiesto con el tamaño de cada archivo recogido, y
+#        un aviso explícito cuando el paquete baja de 2 KB.
+#   [P4] El resumen del diagnóstico ofrece '--reparar' cuando encuentra fallos:
+#        antes sólo sabía sugerir '--diag', que no arregla nada.
+#
+#  CAMBIOS v2.1.0 (el sitio no volvía tras apagar y encender la máquina):
+#   SÍNTOMA: el despliegue terminaba con las validaciones en verde y el sitio
+#   respondía. Al reiniciar, el navegador daba ERR_CONNECTION_REFUSED: NADA
+#   escuchaba en el puerto 80.
+#
+#   CAUSA RAÍZ, en esta misma Fase 7:
+#       systemctl enable --now mariadb          <- habilitado
+#       systemctl enable --now redis-server     <- habilitado
+#       systemctl enable --now supervisor       <- habilitado
+#       systemctl reload nginx || systemctl restart nginx   <- NUNCA 'enable'
+#   nginx era el único servicio que jamás se habilitaba. En una VM no se nota,
+#   porque el postinst del .deb de Ubuntu habilita la unidad por su cuenta; en
+#   una plantilla LXC ese postinst suele correr con policy-rc.d denegando
+#   acciones de systemd y el 'enable' se pierde EN SILENCIO.
+#   Y la validación final lo daba por bueno porque comprobaba 'is-active'
+#   (está corriendo AHORA) y nunca 'is-enabled' (volverá tras reiniciar).
+#
+#   [R1] 'systemctl enable nginx' antes del reload, y una FASE 7.5 que habilita
+#        explícitamente los cinco servicios y COMPRUEBA el resultado.
+#   [R2] Segunda bomba de relojería, causa del 502 intermitente tras reboot:
+#        la unidad de supervisor de Ubuntu declara sólo
+#            After=network.target nss-lookup.target
+#        así que lanza los gunicorn y los workers ANTES de que MariaDB acepte
+#        conexiones. Los procesos mueren, supervisor agota sus 3 'startretries'
+#        en segundos y los deja en FATAL PARA SIEMPRE. Se corrige con drop-ins
+#        de orden (After/Wants mariadb+redis) y Restart=on-failure.
+#   [R3] startretries=10 / startsecs=10 en los programas de supervisor: 3
+#        intentos se agotan antes de que termine la recuperación de InnoDB
+#        tras un apagado sucio. OJO: 'bench setup supervisor' REGENERA
+#        config/supervisor.conf y borra el ajuste.
+#   [R4] Unidad 'frappe-boot.service': 'After=mariadb.service' sólo garantiza
+#        que systemd LANZÓ MariaDB, no que la base de datos esté lista. Esta
+#        unidad espera hasta 5 min a que la BD responda de verdad, rearranca el
+#        grupo de Supervisor, levanta nginx si su config valida y deja el
+#        resultado en /var/log/frappe-boot.log.
+#   [R5] La validación final comprueba ahora 'is-enabled' de los cuatro
+#        servicios y de frappe-boot.service.
+#   [R6] Recordatorio en CT: si el contenedor no arranca con el nodo, nada de
+#        lo anterior importa.  EN EL HOST:  pct set <VMID> --onboot 1
 #
 #  CAMBIOS v11 (el prompt "[sudo] password for sysadmin" que bloqueaba init):
 #   CAUSA, en bench/utils/bench.py:340
@@ -841,16 +929,22 @@ ACTION="install"
 while (( $# > 0 )); do
   case "$1" in
     --status) ACTION="status" ;;
+    --reparar|--repair|--fix) ACTION="reparar" ;;
     --diag)   ACTION="diag"   ;;
     --python-version) shift; PYTHON_VERSION="${1:-3.14}" ;;
     --attach) ACTION="attach" ;;
     --reset)  ACTION="reset"  ;;
     -h|--help)
       cat <<AYUDA
-bashcore-frappe16 v2.0
+bashcore-frappe16 v2.3.0
 
   (sin argumentos)   Instala o reanuda el despliegue.
   --status           Muestra los pasos ya completados.
+  --reparar          REPARA el arranque de un despliegue ya instalado: habilita
+                     los servicios, ordena Supervisor tras MariaDB/Redis y deja
+                     el sitio levantándose solo tras un reinicio. NO pregunta
+                     nada y NO reinstala. Es lo que hay que usar cuando el
+                     sitio no vuelve tras apagar y encender la máquina.
   --diag             Empaqueta TODOS los logs en un .tar.gz para compartir.
   --python-version X.Y  Fuerza la versión de Python (por defecto 3.14).
   --attach           Se reengancha a la consola de la instalación en curso.
@@ -982,9 +1076,35 @@ if [[ "$ACTION" == "diag" ]]; then
     echo "El paquete quedó vacío: revisa permisos en ${ROOTDIR}"
     exit 1
   fi
+  # [v2.2.0] 'du -h' informa BLOQUES EN DISCO, no bytes: un paquete de 512
+  # bytes y uno de 3 KB se veían igual, y no había forma de saber si los
+  # recolectores habían recogido algo. Ahora se imprime el tamaño real y un
+  # manifiesto, y se avisa cuando el paquete es sospechosamente pequeño.
+  DIAG_BYTES="$(stat -c %s "$DIAG_OUT" 2>/dev/null || echo 0)"
   echo
   echo "Paquete de diagnóstico listo:"
-  echo "    ${DIAG_OUT}   ($(du -h "$DIAG_OUT" 2>/dev/null | cut -f1))"
+  echo "    ${DIAG_OUT}   (${DIAG_BYTES} bytes)"
+  echo
+  echo "Contenido (tamaño sin comprimir):"
+  tar -tzvf "$DIAG_OUT" 2>/dev/null \
+    | awk '$3 ~ /^[0-9]+$/ && $3 > 0 {printf "    %8d B  %s\n", $3, $NF}' | sort -k3 || true
+  DIAG_CRUDO="$(tar -tzvf "$DIAG_OUT" 2>/dev/null | awk '$3 ~ /^[0-9]+$/ {t+=$3} END{print t+0}')"
+  echo "    ---------------------"
+  echo "    $(printf '%8d' "${DIAG_CRUDO:-0}") B  total sin comprimir"
+  # El juicio se hace sobre el contenido CRUDO, no sobre el .gz: texto repetido
+  # comprime tanto que un paquete útil y uno vacío pesan casi lo mismo.
+  if (( ${DIAG_CRUDO:-0} < 8192 )); then
+    echo
+    echo "  AVISO: el paquete trae muy pocos datos (${DIAG_CRUDO:-0} B sin"
+    echo "  comprimir). Mira el listado de arriba: los archivos que no"
+    echo "  aparecen son recolectores que volvieron vacíos. Los tres que"
+    echo "  suelen faltar y por qué:"
+    echo "    01-bashcore.log   -> no existe ${LOG_FILE}"
+    echo "                         (el despliegue se hizo desde otra ruta)"
+    echo "    02-userphase.log  -> ya no está en el home del usuario"
+    echo "    06-journal.txt    -> journalctl sin datos persistentes; activa:"
+    echo "                         mkdir -p /var/log/journal && systemctl restart systemd-journald"
+  fi
   echo
   echo "Descárgalo con:"
   echo "    scp -P <puerto> root@<ip>:${DIAG_OUT} ."
@@ -1051,6 +1171,7 @@ menu_diagnostico() {
     say "    ${BOLD}7${NC}) Errores recientes en los registros\n"
     say "    ${BOLD}8${NC}) Recursos: memoria, disco e inodos\n"
     say "    ${BOLD}9${NC}) Generar paquete de diagnóstico (.tar.gz)\n"
+    say "    ${BOLD}R${NC}) REPARAR el arranque ahora (habilita servicios y ordena el boot)\n"
     say "    ${BOLD}0${NC}) Volver al menú principal\n\n  > "
     local op; read -r op || op=0
     case "$(trim "${op}")" in
@@ -1063,6 +1184,7 @@ menu_diagnostico() {
       7) diagnostico errores ;;
       8) diagnostico recursos ;;
       9) generar_diag ;;
+      R|r|reparar|10) reparar_arranque ;;
       0) return 0 ;;
       *) say "  ${RED}Opción no válida.${NC}\n" ;;
     esac
@@ -1121,7 +1243,10 @@ diagnostico() {
 
       say "\n  ${BOLD}Respuesta del sitio${NC}\n"
       local codigo
-      codigo="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${SITIO_DETECTADO}" http://127.0.0.1/ 2>/dev/null || echo 000)"
+      # [v2.2.0] curl YA imprime '000' cuando no conecta, y ADEMÁS sale con
+      # código != 0: el '|| echo 000' añadía un segundo 000 y se leía "000000".
+      codigo="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${SITIO_DETECTADO}" http://127.0.0.1/ 2>/dev/null)"
+      codigo="${codigo:0:3}"; codigo="${codigo:-000}"
       if [[ "$codigo" =~ ^(200|302|303)$ ]]; then
         say "    ${GREEN}[ OK ]${NC} HTTP ${codigo} en http://${SITIO_DETECTADO}/\n"
       else
@@ -1184,6 +1309,7 @@ diagnostico() {
     say "${GREEN}todo correcto${NC}\n\n"
   else
     say "${RED}${fallos} comprobación(es) con problemas${NC}\n"
+    say "  Repáralo con:                   bash $0 --reparar\n"
     say "  Genera el paquete completo con: bash $0 --diag\n\n"
   fi
   return 0
@@ -1398,19 +1524,449 @@ menu_version() {
   done
 }
 
+# =============================================================================
+#  REPARACIÓN DEL ARRANQUE  [v2.2.0]
+#  Un despliegue que sólo funciona hasta el primer reinicio no está desplegado.
+#  Esta función arregla un servidor YA instalado sin preguntar nada, sin apt y
+#  sin tocar MariaDB, el sitio ni el sudoers. Es idempotente.
+#
+#  Las dos causas, verificadas en campo:
+#   1. nginx era el único servicio que el script nunca habilitaba: mariadb,
+#      redis-server y supervisor llevaban 'enable --now', nginx sólo 'reload'.
+#      En una VM no se nota (el postinst del .deb lo habilita), pero en una
+#      plantilla LXC ese postinst corre con policy-rc.d denegando acciones de
+#      systemd y el enable se pierde EN SILENCIO. Al reiniciar, nadie abre el
+#      puerto 80: ERR_CONNECTION_REFUSED.
+#   2. La unidad de supervisor de Ubuntu declara sólo
+#          After=network.target nss-lookup.target
+#      así que lanza los gunicorn y los workers ANTES de que MariaDB acepte
+#      conexiones. Mueren, se agotan los 3 startretries en segundos y quedan
+#      en FATAL para siempre: 502 hasta que alguien entra por SSH.
+# =============================================================================
+# --- Saneador de configuración de Nginx  [v2.3.0] ---------------------------
+# Lee el error exacto de 'nginx -t', localiza la directiva duplicada y la
+# comenta. REGLA DE ORO: sólo toca archivos que crea este script. Si el
+# duplicado está en configuración ajena (nginx.conf del sistema, la que genera
+# Frappe, algo escrito a mano), NO la modifica: lo dice y se detiene.
+_ngx_comentar() {   # archivo · línea
+  python3 - "$1" "$2" <<'PYNGX'
+import sys
+f, n = sys.argv[1], int(sys.argv[2])
+lineas = open(f, encoding='utf-8').read().split('\n')
+if n < 1 or n > len(lineas):
+    sys.exit(1)
+i = n - 1
+# Una directiva puede ocupar VARIAS líneas (log_format es el caso típico):
+# comentar sólo la primera dejaría las continuaciones sueltas y el archivo
+# quedaría peor que antes. Se comenta hasta la línea que cierra con ';'.
+while i < len(lineas):
+    lineas[i] = '# [bashcore: duplicada] ' + lineas[i]
+    if lineas[i].rstrip().endswith(';'):
+        break
+    i += 1
+open(f, 'w', encoding='utf-8').write('\n'.join(lineas))
+PYNGX
+}
+
+_nginx_sanar() {
+  local intentos=0 salida directiva archivo linea patron
+  # Un único sed extrae las tres piezas del mensaje de nginx:
+  #   "server_tokens" directive is duplicate in /ruta/archivo.conf:6
+  patron='s/.*"\([^"]*\)" directive is duplicate in \([^:]*\):\([0-9]*\).*/'
+  while (( intentos < 6 )); do
+    salida="$( { nginx -t 2>&1 || true; } )"
+    printf '%s' "$salida" | grep -q 'test is successful' && return 0
+    directiva="$(printf '%s\n' "$salida" | sed -n "${patron}\\1/p" | head -1)"
+    archivo="$( printf '%s\n' "$salida" | sed -n "${patron}\\2/p" | head -1)"
+    linea="$(   printf '%s\n' "$salida" | sed -n "${patron}\\3/p" | head -1)"
+    [[ -n "$archivo" && -n "$linea" ]] || return 1
+    case "$archivo" in
+      */00-bashcore-hardening.conf|*/00-frappe-logformat.conf) ;;
+      *) r_bad "'${directiva}' duplicada en ${archivo}:${linea}."
+         r_bad "Ese archivo no lo gestiona este script: no lo toco. Revísalo a mano."
+         return 1 ;;
+    esac
+    _ngx_comentar "$archivo" "$linea" || { r_bad "no pude editar ${archivo}:${linea}"; return 1; }
+    r_act "'${directiva}' duplicada en $(basename "$archivo"):${linea} -> comentada."
+    intentos=$((intentos+1))
+  done
+  return 1
+}
+
+reparar_arranque() {
+  # Una herramienta de reparación NUNCA debe abortar a la primera dificultad:
+  # justo se usa cuando el sistema está roto. 'set +e' no basta, el trap ERR
+  # sigue disparando, así que se retira explícitamente.
+  set +e
+  trap - ERR
+
+  local es_ct=0 svc en aciertos=0 total=0
+  systemd-detect-virt -c >/dev/null 2>&1 && es_ct=1
+
+  r_ok()   { say "    ${GREEN}[ OK ]${NC} $*\n"; }
+  r_bad()  { say "    ${RED}[FALLA]${NC} $*\n"; }
+  r_act()  { say "    ${BOLD}[ARREGLO]${NC} $*\n"; }
+  r_inf()  { say "    ${BLUE}[INFO]${NC} $*\n"; }
+  r_wrn()  { say "    ${YELLOW}[AVISO]${NC} $*\n"; }
+  r_chk()  { local d="$1"; shift; total=$((total+1))
+             if "$@" >/dev/null 2>&1; then r_ok "$d"; aciertos=$((aciertos+1))
+             else r_bad "$d"; fi; }
+
+  say "\n${BOLD}  REPARACIÓN DEL ARRANQUE${NC}\n\n"
+
+  if ! detectar_instalacion; then
+    r_bad "No encontré ninguna instalación de Frappe en ${HOMEBASE}."
+    r_inf "Nada que reparar. Si el bench está en otra ruta, muévelo o avisa."
+    say "\n"
+    return 1
+  fi
+  local BD="$BENCH_DETECTADO" UD="$USER_DETECTADO" ST="$SITIO_DETECTADO"
+  r_ok "bench: ${BD}  ·  usuario: ${UD}  ·  sitio: ${ST:-(ninguno)}"
+  (( es_ct )) && r_inf "Entorno: contenedor LXC."
+
+  # --- 1. Habilitar cada servicio en el arranque -----------------------------
+  say "\n  ${BOLD}1. Servicios habilitados en el arranque${NC}\n"
+  for svc in mariadb redis-server nginx supervisor cron; do
+    systemctl list-unit-files "${svc}.service" 2>/dev/null | grep -q "^${svc}.service" || continue
+    # OJO: 'is-enabled' devuelve código != 0 cuando responde 'disabled', que
+    # es información válida. Se recoge la salida, no el código de salida.
+    en="$(systemctl is-enabled "$svc" 2>/dev/null)"; en="${en%%$'\n'*}"
+    if [[ "$en" == "enabled" || "$en" == "static" ]]; then
+      r_inf "${svc}: ya estaba habilitado."
+    elif systemctl enable "$svc" >/dev/null 2>&1; then
+      r_act "${svc}: HABILITADO (antes: ${en:-desconocido})."
+    else
+      r_bad "${svc}: no se pudo habilitar."
+    fi
+  done
+
+  # --- 2. Orden de arranque mediante drop-ins --------------------------------
+  # Drop-ins y no ediciones de las unidades: sobreviven a las actualizaciones
+  # de los paquetes y se pueden borrar sin dejar rastro.
+  say "\n  ${BOLD}2. Orden de arranque (Supervisor detrás de MariaDB y Redis)${NC}\n"
+  _dropin() {
+    local u="$1" f="$2"; shift 2
+    mkdir -p "${ETC}/systemd/system/${u}.service.d" 2>/dev/null
+    printf '%s\n' "$@" > "${ETC}/systemd/system/${u}.service.d/${f}" 2>/dev/null \
+      && r_act "${u}: ${f}" || r_bad "${u}: no pude escribir ${f}"
+  }
+  _dropin supervisor 10-frappe-orden.conf \
+    '# bashcore v2.2.0: supervisor NUNCA antes de MariaDB y Redis.' \
+    '[Unit]' \
+    'After=network-online.target mariadb.service redis-server.service' \
+    'Wants=network-online.target mariadb.service' \
+    '' '[Service]' 'Restart=on-failure' 'RestartSec=10' 'TimeoutStartSec=180'
+  _dropin nginx 10-frappe-orden.conf \
+    '# bashcore v2.2.0: nginx tras supervisor y con reintento.' \
+    '[Unit]' \
+    'After=network-online.target supervisor.service' \
+    'Wants=network-online.target' \
+    '' '[Service]' 'Restart=on-failure' 'RestartSec=5'
+  _dropin mariadb 10-frappe-arranque.conf \
+    '[Service]' '# "infinity" rompe dentro de LXC: alto pero finito.' \
+    'LimitNOFILE=1048576' 'Restart=on-failure' 'RestartSec=10'
+  if systemctl list-unit-files redis-server.service 2>/dev/null | grep -q '^redis-server.service'; then
+    _dropin redis-server 10-frappe-arranque.conf \
+      '[Service]' 'Restart=always' 'RestartSec=5'
+  fi
+
+  # --- 3. Configuración de Nginx --------------------------------------------
+  say "\n  ${BOLD}3. Configuración de Nginx${NC}\n"
+  if [[ -f "${BD}/config/nginx.conf" ]]; then
+    ln -sf "${BD}/config/nginx.conf" "${ETC}/nginx/conf.d/frappe-bench.conf" 2>/dev/null \
+      && r_act "conf.d/frappe-bench.conf enlazado." || r_bad "no pude enlazar frappe-bench.conf"
+  else
+    r_wrn "Falta ${BD}/config/nginx.conf: lo regenero como ${UD}."
+    su - "$UD" -c "cd '${BD}' && bench setup nginx --yes" >/dev/null 2>&1
+    [[ -f "${BD}/config/nginx.conf" ]] \
+      && ln -sf "${BD}/config/nginx.conf" "${ETC}/nginx/conf.d/frappe-bench.conf" \
+      && r_act "nginx.conf regenerado y enlazado." \
+      || r_bad "no se pudo regenerar nginx.conf."
+  fi
+  # El 'default' de Ubuntu reaparece con cada actualización del paquete y roba
+  # el puerto 80.
+  if [[ -e "${ETC}/nginx/sites-enabled/default" ]]; then
+    rm -f "${ETC}/nginx/sites-enabled/default" && r_act "sitio 'default' de Ubuntu deshabilitado."
+  else
+    r_inf "sitio 'default' de Ubuntu: ya estaba fuera."
+  fi
+  # La config que genera Frappe usa 'access_log ... main;' y el paquete de
+  # nginx de Ubuntu NO define ese formato: 'nginx -t' falla con
+  # unknown log format "main" y el servicio no arranca ni a mano ni en el boot.
+  if grep -rqs '^[[:space:]]*log_format[[:space:]]\+main' \
+       "${ETC}/nginx/nginx.conf" "${ETC}/nginx/conf.d/" 2>/dev/null; then
+    r_inf "log_format 'main': ya definido."
+  else
+    mkdir -p "${ETC}/nginx/conf.d" 2>/dev/null
+    cat > "${ETC}/nginx/conf.d/00-frappe-logformat.conf" <<'NGXLOGF'
+# bashcore v2.2.0: la configuración de Frappe usa 'access_log ... main;' y el
+# paquete de nginx de Ubuntu no define ese formato (el de nginx.org sí).
+log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                '$status $body_bytes_sent "$http_referer" '
+                '"$http_user_agent" "$http_x_forwarded_for"';
+NGXLOGF
+    r_act "log_format 'main' definido."
+  fi
+
+
+  # --- 3.b Directivas duplicadas que impiden arrancar nginx ----------------
+  # Síntoma real en campo:
+  #   [emerg] "server_tokens" directive is duplicate in
+  #           /etc/nginx/conf.d/00-bashcore-hardening.conf:6
+  # nginx queda 'enabled' pero no arranca: el puerto 80 sigue cerrado y el
+  # navegador dice ERR_CONNECTION_REFUSED igual que si no estuviera habilitado.
+  # Causa: el hardening llegó por dos caminos a la vez (incrustado en
+  # nginx.conf por una versión vieja + el snippet de conf.d de una nueva).
+  if [[ -f "${ETC}/nginx/nginx.conf" ]] \
+     && [[ -f "${ETC}/nginx/conf.d/00-bashcore-hardening.conf" ]] \
+     && grep -q 'BASHCORE-HARDENING' "${ETC}/nginx/nginx.conf" 2>/dev/null; then
+    cp -n "${ETC}/nginx/nginx.conf" "${ETC}/nginx/nginx.conf.antes-de-reparar" 2>/dev/null
+    sed -i '\|--- BASHCORE-HARDENING|,\|--- /BASHCORE-HARDENING ---|d' "${ETC}/nginx/nginx.conf"
+    r_act "retirado el hardening incrustado en nginx.conf (duplicaba el de conf.d)."
+  fi
+
+  if nginx -t >/dev/null 2>&1; then
+    r_inf "nginx -t: la configuración ya era válida."
+  elif _nginx_sanar; then
+    r_ok "nginx -t: configuración saneada y VÁLIDA."
+  else
+    r_bad "nginx -t falla por algo que no puedo resolver solo:"
+    { nginx -t 2>&1 || true; } | sed 's/^/        /' > /tmp/.bc_ngx0
+    while IFS= read -r _l; do say "${_l}\n"; done < /tmp/.bc_ngx0
+    rm -f /tmp/.bc_ngx0
+  fi
+
+  # --- 4. Configuración de Supervisor ---------------------------------------
+  say "\n  ${BOLD}4. Configuración de Supervisor${NC}\n"
+  if [[ -f "${BD}/config/supervisor.conf" ]]; then
+    mkdir -p "${ETC}/supervisor/conf.d" 2>/dev/null
+    ln -sf "${BD}/config/supervisor.conf" "${ETC}/supervisor/conf.d/frappe-bench.conf" 2>/dev/null \
+      && r_act "conf.d/frappe-bench.conf enlazado." || r_bad "no pude enlazar."
+  else
+    r_wrn "Falta ${BD}/config/supervisor.conf: lo regenero como ${UD}."
+    su - "$UD" -c "cd '${BD}' && bench setup supervisor --yes" >/dev/null 2>&1
+    [[ -f "${BD}/config/supervisor.conf" ]] \
+      && ln -sf "${BD}/config/supervisor.conf" "${ETC}/supervisor/conf.d/frappe-bench.conf" \
+      && r_act "supervisor.conf regenerado y enlazado." \
+      || r_bad "no se pudo regenerar supervisor.conf."
+  fi
+  # La plantilla de Frappe deja startretries=3 y startsecs por defecto: en un
+  # arranque en frío eso se agota antes de que termine la recuperación de
+  # InnoDB. OJO: 'bench setup supervisor' regenera el archivo y borra esto.
+  if [[ ! -f "${BD}/config/supervisor.conf" ]] || ! command -v python3 >/dev/null 2>&1; then
+    :
+  elif grep -q 'bashcore-arranque' "${BD}/config/supervisor.conf" 2>/dev/null; then
+    r_inf "startretries: ya estaba ajustado."
+  else
+    # La salida de python va a /dev/null: el resultado se comprueba después
+    # sobre el archivo, que es la única evidencia que importa.
+    python3 - "${BD}/config/supervisor.conf" >/dev/null 2>&1 <<'PYSUPREP'
+import re, sys, shutil
+p = sys.argv[1]
+src = open(p, encoding='utf-8').read()
+if 'bashcore-arranque' in src:
+    sys.exit(0)
+shutil.copy2(p, p + '.antes-de-reparar')
+out = []
+for b in re.split(r'(?m)^(?=\[)', src):
+    if b.startswith('[program:'):
+        c = b.rstrip('\n')
+        for k in ('startretries=10', 'startsecs=10'):
+            nombre = k.split('=')[0]
+            if re.search(r'(?m)^%s\s*=' % nombre, c):
+                c = re.sub(r'(?m)^%s\s*=.*$' % nombre, k, c)
+            else:
+                c += '\n' + k
+        b = c + '\n\n'
+    out.append(b)
+open(p, 'w', encoding='utf-8').write(
+    '; bashcore-arranque: startretries=10 / startsecs=10.\n'
+    '; 3 reintentos se agotaban antes de que MariaDB estuviera lista.\n'
+    '; "bench setup supervisor" REGENERA este archivo y borra el ajuste.\n'
+    + ''.join(out))
+PYSUPREP
+    chown "${UD}:${UD}" "${BD}/config/supervisor.conf" 2>/dev/null
+    if grep -q 'bashcore-arranque' "${BD}/config/supervisor.conf" 2>/dev/null; then
+      r_act "startretries=10 / startsecs=10 en los programas de Frappe."
+      r_inf "copia previa: config/supervisor.conf.antes-de-reparar"
+    else
+      r_bad "no pude ajustar los reintentos de supervisor.conf."
+    fi
+  fi
+
+  # --- 5. Unidad que espera a la base de datos ------------------------------
+  # 'After=mariadb.service' sólo garantiza que systemd LANZÓ MariaDB, no que
+  # la base de datos acepte conexiones. Tras un apagado sucio la recuperación
+  # de InnoDB tarda decenas de segundos. Esta unidad espera de verdad.
+  say "\n  ${BOLD}5. Red de seguridad de arranque (frappe-boot.service)${NC}\n"
+  mkdir -p "$USRLOCALBIN" "${ETC}/systemd/system" 2>/dev/null
+  cat > "${USRLOCALBIN}/frappe-boot-wait.sh" <<'BOOTWAIT'
+#!/usr/bin/env bash
+# Generado por bashcore-frappe v2.2.0 (reparar_arranque).
+set -u
+LOG=/var/log/frappe-boot.log
+say() { printf '%s  %s\n' "$(date -Is)" "$*" >> "$LOG"; }
+say "=== frappe-boot: inicio ==="
+
+listo=0
+for i in $(seq 1 60); do
+  out="$(mariadb -u __sonda__ -p__sonda__ -h 127.0.0.1 -e 'SELECT 1' 2>&1)"
+  case "$out" in *"Access denied"*|*"using password"*) listo=1; break ;; esac
+  if [ -S /run/mysqld/mysqld.sock ] || [ -S /var/run/mysqld/mysqld.sock ]; then
+    mariadb-admin --protocol=socket ping >/dev/null 2>&1 && { listo=1; break; }
+  fi
+  sleep 5
+done
+[ "$listo" = "1" ] && say "MariaDB lista." || say "AVISO: MariaDB no respondió en 5 min."
+
+systemctl is-active --quiet supervisor || { say "arranco supervisor"; systemctl start supervisor >/dev/null 2>&1; sleep 5; }
+supervisorctl reread      >>"$LOG" 2>&1
+supervisorctl update      >>"$LOG" 2>&1
+supervisorctl restart all >>"$LOG" 2>&1
+sleep 10
+say "--- estado de supervisor ---"
+supervisorctl status >>"$LOG" 2>&1
+
+if nginx -t >/dev/null 2>&1; then
+  systemctl is-active --quiet nginx || { say "arranco nginx"; systemctl start nginx >>"$LOG" 2>&1; }
+else
+  say "ERROR: nginx -t falla; no arranco nginx:"; nginx -t >>"$LOG" 2>&1
+fi
+
+SITIO="$(cat /etc/frappe-boot-site 2>/dev/null || true)"
+if [ -n "$SITIO" ]; then
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${SITIO}" http://127.0.0.1/ 2>/dev/null)"
+  say "HTTP local para ${SITIO}: ${code:-000}"
+fi
+say "=== frappe-boot: fin ==="
+exit 0
+BOOTWAIT
+  chmod 750 "${USRLOCALBIN}/frappe-boot-wait.sh" 2>/dev/null
+  [[ -n "$ST" ]] && printf '%s\n' "$ST" > "${ETC}/frappe-boot-site" 2>/dev/null
+  cat > "${ETC}/systemd/system/frappe-boot.service" <<BOOTUNIT
+# Generado por bashcore-frappe v2.2.0 (reparar_arranque).
+[Unit]
+Description=Frappe: espera a MariaDB y levanta el grupo de Supervisor
+After=network-online.target mariadb.service redis-server.service supervisor.service
+Wants=network-online.target mariadb.service supervisor.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${USRLOCALBIN}/frappe-boot-wait.sh
+TimeoutStartSec=420
+
+[Install]
+WantedBy=multi-user.target
+BOOTUNIT
+  systemctl daemon-reload >/dev/null 2>&1
+  systemctl enable frappe-boot.service >/dev/null 2>&1 \
+    && r_act "frappe-boot.service instalada y habilitada." \
+    || r_bad "frappe-boot.service no se pudo habilitar."
+
+  # --- 6. El sitio en /etc/hosts -------------------------------------------
+  if [[ -n "$ST" ]]; then
+    if grep -qE "[[:space:]]${ST}([[:space:]]|$)" "${ETC}/hosts" 2>/dev/null; then
+      r_inf "/etc/hosts: el sitio ya estaba registrado."
+    else
+      printf '127.0.0.1 %s\n' "$ST" >> "${ETC}/hosts" 2>/dev/null \
+        && r_act "/etc/hosts: añadido '127.0.0.1 ${ST}'."
+    fi
+  fi
+
+  # --- 7. Levantarlo ahora, en el orden correcto ---------------------------
+  say "\n  ${BOLD}6. Arrancando en el orden correcto${NC}\n"
+  for svc in mariadb redis-server; do
+    systemctl list-unit-files "${svc}.service" 2>/dev/null | grep -q "^${svc}.service" || continue
+    systemctl restart "$svc" >/dev/null 2>&1 && r_ok "${svc} reiniciado." || r_bad "${svc} no arrancó."
+  done
+  sleep 5
+  systemctl restart supervisor >/dev/null 2>&1 && r_ok "supervisor reiniciado." || r_bad "supervisor no arrancó."
+  sleep 5
+  "${USRLOCALBIN}/frappe-boot-wait.sh" >/dev/null 2>&1
+  if nginx -t >/dev/null 2>&1; then
+    systemctl restart nginx >/dev/null 2>&1 && r_ok "nginx reiniciado." || r_bad "nginx no arrancó."
+  else
+    r_bad "nginx -t sigue fallando; NO lo reinicio. Error exacto:"
+    { nginx -t 2>&1 || true; } | sed 's/^/        /' > /tmp/.bc_ngx
+    while IFS= read -r l; do say "${l}\n"; done < /tmp/.bc_ngx
+    rm -f /tmp/.bc_ngx
+  fi
+
+  # --- 8. Verificación -----------------------------------------------------
+  say "\n  ${BOLD}7. Verificación${NC}\n"
+  for svc in mariadb redis-server nginx supervisor; do
+    systemctl list-unit-files "${svc}.service" 2>/dev/null | grep -q "^${svc}.service" || continue
+    r_chk "${svc}: arranca solo tras reiniciar" systemctl is-enabled "$svc"
+    r_chk "${svc}: corriendo ahora"             systemctl is-active --quiet "$svc"
+  done
+  r_chk "frappe-boot.service habilitada" systemctl is-enabled frappe-boot.service
+  r_chk "puerto 80 escuchando"           bash -c "ss -H -tln | grep -q ':80[[:space:]]'"
+  r_chk "configuración de Nginx válida"  nginx -t
+
+  if [[ -n "$ST" ]]; then
+    local cod
+    cod="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${ST}" http://127.0.0.1/ 2>/dev/null)"
+    cod="${cod:0:3}"; cod="${cod:-000}"
+    total=$((total+1))
+    if [[ "$cod" =~ ^(200|302|303)$ ]]; then
+      r_ok "el sitio responde por HTTP (${cod})."; aciertos=$((aciertos+1))
+    else
+      r_bad "el sitio devolvió ${cod}."
+    fi
+  fi
+
+  say "\n  ${BOLD}Resultado: ${aciertos}/${total} comprobaciones OK${NC}\n\n"
+  if (( aciertos == total )); then
+    say "  ${GREEN}${BOLD}Todo en orden.${NC} Confírmalo con la única prueba que vale:\n\n"
+    say "      reboot\n"
+    say "      # al volver:\n"
+    say "      bash $0 --reparar    (vuelve a verificar; es idempotente)\n"
+    say "      cat /var/log/frappe-boot.log\n\n"
+  else
+    say "  Revisa lo marcado en rojo. Registro del arranque: /var/log/frappe-boot.log\n"
+    say "  Paquete completo para compartir: bash $0 --diag\n\n"
+  fi
+  if (( es_ct )); then
+    say "  ${YELLOW}${BOLD}EN EL NODO PROXMOX, NO AQUÍ${NC}\n"
+    say "    pct set <VMID> --onboot 1     # si el CT no arranca, nada de esto sirve\n"
+    say "    pct set <VMID> --swap 4096    # 0MB de swap con assets de v16 es justo\n\n"
+  fi
+  return 0
+}
+
+# --- Despachador de --reparar ------------------------------------------------
+# Va aquí, después de las funciones que usa y ANTES de que el script redirija
+# la salida al log y entre en la Fase 0: reparar no es instalar.
+if [[ "$ACTION" == "reparar" ]]; then
+  if [[ -z "$BC_PREFIX" && "${EUID}" -ne 0 ]]; then
+    echo "La reparación necesita root. Usa:  sudo -i  y luego  bash $0 --reparar" >&2
+    exit 1
+  fi
+  if [[ -z "$BC_PREFIX" && ! -d /run/systemd/system ]]; then
+    echo "Este sistema no arrancó con systemd como PID 1: no hay nada que habilitar." >&2
+    exit 1
+  fi
+  reparar_arranque
+  exit $?
+fi
+
 menu_principal() {
   while :; do
     say "\n  ${BOLD}¿Qué quieres hacer?${NC}\n\n"
     say "    ${BOLD}1${NC}) Instalar      · despliegue limpio con hardening CIS\n"
     say "    ${BOLD}2${NC}) Diagnóstico   · estado de servicios, sitio y errores\n"
-    say "    ${BOLD}3${NC}) Desinstalar   · eliminar todo y dejar el sistema como estaba\n"
-    say "    ${BOLD}4${NC}) Salir\n\n  > "
-    local op; read -r op || op=4
+    say "    ${BOLD}3${NC}) Reparar       · el sitio no vuelve tras reiniciar (no reinstala)\n"
+    say "    ${BOLD}4${NC}) Desinstalar   · eliminar todo y dejar el sistema como estaba\n"
+    say "    ${BOLD}5${NC}) Salir\n\n  > "
+    local op; read -r op || op=5
     case "$(trim "${op}")" in
       1) if menu_version; then return 0; fi ;;   # continúa a la instalación
       2) menu_diagnostico ;;          # vuelve al menú al terminar
-      3) desinstalar ;;               # vuelve al menú al terminar
-      4) say "\n  Hasta luego.\n\n"; exit 0 ;;
+      3) reparar_arranque ;;          # vuelve al menú al terminar
+      4) desinstalar ;;               # vuelve al menú al terminar
+      5) say "\n  Hasta luego.\n\n"; exit 0 ;;
       *) say "  ${RED}Opción no válida.${NC}\n" ;;
     esac
   done
@@ -3754,13 +4310,26 @@ mkdir -p "${ETC}/nginx/conf.d"
 if [[ -f "$NGINX_MAIN" ]] && grep -qE '^\s*include\s+/etc/nginx/conf\.d/\*\.conf;' "$NGINX_MAIN"; then
   # Ruta preferida: conf.d ya se incluye DENTRO del bloque http, así que un
   # snippet propio es idempotente y sobrevive a las actualizaciones del paquete.
+
+  # [v2.3.0] Las versiones antiguas de este script inyectaban el hardening
+  # DENTRO de nginx.conf (bloque BASHCORE-HARDENING). Si ese bloque sigue ahí
+  # y además escribimos el snippet de conf.d, 'server_tokens' queda definido
+  # dos veces en el mismo contexto http y nginx muere al arrancar con:
+  #     "server_tokens" directive is duplicate in .../00-bashcore-hardening.conf:6
+  # El snippet de conf.d es la ruta buena, así que el incrustado se retira.
+  if grep -q 'BASHCORE-HARDENING' "$NGINX_MAIN" 2>/dev/null; then
+    cp -n "$NGINX_MAIN" "${NGINX_MAIN}.antes-de-limpiar" 2>/dev/null || true
+    sed -i '\|--- BASHCORE-HARDENING|,\|--- /BASHCORE-HARDENING ---|d' "$NGINX_MAIN"
+    ok "Retirado el hardening incrustado en nginx.conf (ahora vive en conf.d)."
+  fi
   cat > "${ETC}/nginx/conf.d/00-bashcore-hardening.conf" <<'NGXSEC'
 # ==========================================================
 #  Hardening HTTP - CIS NGINX Benchmark v3.0.0
 #  Contexto: http { }  (incluido vía conf.d/*.conf)
 # ==========================================================
-# (CIS 2.5.1) Ocultar la versión del servidor
-server_tokens off;
+# (CIS 2.5.1) 'server_tokens' NO se escribe aquí: se añade justo después de
+# este heredoc y sólo si nadie más lo ha definido ya. Es una directiva única
+# por contexto y duplicarla impide que nginx arranque.
 
 # (CIS 5.3.1) Anti-Clickjacking
 add_header X-Frame-Options SAMEORIGIN always;
@@ -3774,6 +4343,15 @@ add_header X-XSS-Protection "1; mode=block" always;
 # Control de fuga de referrers
 add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 NGXSEC
+  # [v2.3.0] 'server_tokens' es única por contexto. Se comprueba DESPUÉS de
+  # escribir el snippet (que ya no la trae) y sobre toda la configuración.
+  if grep -rqsE '^[[:space:]]*server_tokens' "$NGINX_MAIN" "${ETC}/nginx/conf.d/" 2>/dev/null; then
+    info "'server_tokens' ya estaba definido; no se duplica (rompería nginx -t)."
+  else
+    printf '\n# (CIS 2.5.1) Ocultar la versión del servidor\nserver_tokens off;\n' \
+      >> "${ETC}/nginx/conf.d/00-bashcore-hardening.conf"
+    ok "server_tokens off (CIS 2.5.1)."
+  fi
   # La configuración que genera Frappe usa 'access_log ... main;' y el paquete
   # de nginx de Ubuntu NO define ese formato (el de nginx.org sí). Sin esto,
   # 'nginx -t' falla con: unknown log format "main".
@@ -3867,6 +4445,9 @@ fi
 
 info "Validando la configuración de Nginx (nginx -t)..."
 if nginx -t; then
+  # [BASHCORE-ARRANQUE-v1] enable ANTES de reload: sin esto la unidad
+  # puede quedar sin habilitar y el sitio no vuelve tras un reinicio.
+  systemctl enable nginx >/dev/null 2>&1 || true
   systemctl reload nginx || systemctl restart nginx
   ok "Nginx recargado."
 else
@@ -3884,6 +4465,197 @@ sleep 8
 supervisorctl status || true
 avance web OK
 mark_done fase7_web
+
+# =============================================================================
+#  FASE 7.5: PERSISTENCIA DE ARRANQUE   [BASHCORE-ARRANQUE-v1]
+#  Un despliegue que sólo funciona hasta el primer reinicio no está desplegado.
+#  Aquí se garantiza que TODO vuelva solo tras un apagado, limpio o sucio.
+# =============================================================================
+phase "FASE 7.5: PERSISTENCIA DE ARRANQUE"
+actividad "asegurando el arranque automático"
+
+# --- 7.5.1 Habilitar explícitamente cada servicio ---------------------------
+# NUNCA se debe confiar en el 'enable' del postinst de los paquetes: en una
+# plantilla LXC ese postinst suele correr con policy-rc.d denegando acciones de
+# systemd, así que la unidad se instala pero NO queda habilitada. nginx era el
+# caso: se recargaba al final del despliegue y nadie volvía a mirarlo.
+BC_SVCS=(mariadb redis-server nginx supervisor cron)
+for _s in "${BC_SVCS[@]}"; do
+  systemctl list-unit-files "${_s}.service" 2>/dev/null | grep -q "^${_s}.service" || continue
+  _en="$(systemctl is-enabled "$_s" 2>/dev/null || true)"; _en="${_en%%$'\n'*}"
+  if [[ "$_en" == "enabled" || "$_en" == "static" ]]; then
+    info "${_s}: ya habilitado en el arranque."
+  elif systemctl enable "$_s" >/dev/null 2>&1; then
+    ok "${_s}: habilitado en el arranque."
+  else
+    warn "${_s}: NO se pudo habilitar; tras un reinicio no arrancará solo."
+  fi
+done
+
+# --- 7.5.2 Orden de arranque (drop-ins, no ediciones de unidades) -----------
+# La unidad de supervisor de Ubuntu declara sólo:
+#     After=network.target nss-lookup.target
+# Así que supervisor lanza los gunicorn y los workers de Frappe ANTES de que
+# MariaDB acepte conexiones. Los procesos mueren, supervisor agota sus 3
+# 'startretries' en pocos segundos y los deja en FATAL PARA SIEMPRE: el sitio
+# responde 502 hasta que alguien entra por SSH a rearrancarlo a mano.
+bc_dropin() {   # bc_dropin <unidad> <archivo> <líneas...>
+  local _u="$1" _f="$2"; shift 2
+  mkdir -p "${ETC}/systemd/system/${_u}.service.d"
+  printf '%s\n' "$@" > "${ETC}/systemd/system/${_u}.service.d/${_f}"
+  ok "${_u}: drop-in ${_f}"
+}
+
+bc_dropin supervisor 10-frappe-orden.conf \
+'# bashcore: supervisor NUNCA antes de MariaDB y Redis.' \
+'[Unit]' \
+'After=network-online.target mariadb.service redis-server.service' \
+'Wants=network-online.target mariadb.service' \
+'' \
+'[Service]' \
+'Restart=on-failure' \
+'RestartSec=10' \
+'TimeoutStartSec=180'
+
+bc_dropin nginx 10-frappe-orden.conf \
+'# bashcore: nginx tras supervisor (evita el 502 de los primeros segundos)' \
+'# y con reintento si arranca antes de tiempo en un CT con disco lento.' \
+'[Unit]' \
+'After=network-online.target supervisor.service' \
+'Wants=network-online.target' \
+'' \
+'[Service]' \
+'Restart=on-failure' \
+'RestartSec=5'
+
+bc_dropin mariadb 10-frappe-arranque.conf \
+'[Service]' \
+'# "infinity" rompe dentro de LXC: alto pero finito.' \
+'LimitNOFILE=1048576' \
+'Restart=on-failure' \
+'RestartSec=10'
+
+if systemctl list-unit-files redis-server.service 2>/dev/null | grep -q '^redis-server.service'; then
+  bc_dropin redis-server 10-frappe-arranque.conf \
+  '[Service]' \
+  'Restart=always' \
+  'RestartSec=5'
+fi
+
+# --- 7.5.3 Reintentos de los programas de Supervisor ------------------------
+# La plantilla de Frappe deja startretries=3 y startsecs por defecto: en el
+# arranque de un CT con disco compartido eso se agota antes de que la BD esté
+# lista. OJO: 'bench setup supervisor' regenera el archivo y borra el ajuste.
+BC_SUPCONF="${BENCH_DIR}/config/supervisor.conf"
+if [[ -f "$BC_SUPCONF" ]] && command -v python3 >/dev/null 2>&1; then
+  python3 - "$BC_SUPCONF" <<'BCPYSUP' || warn "No se pudieron ampliar los reintentos de supervisor."
+import re, sys, shutil
+p = sys.argv[1]
+src = open(p, encoding='utf-8').read()
+if 'bashcore-arranque' in src:
+    sys.exit(0)
+shutil.copy2(p, p + '.antes-de-arranque')
+out = []
+for b in re.split(r'(?m)^(?=\[)', src):
+    if b.startswith('[program:'):
+        c = b.rstrip('\n')
+        for k in ('startretries=10', 'startsecs=10'):
+            name = k.split('=')[0]
+            if re.search(r'(?m)^%s\s*=' % name, c):
+                c = re.sub(r'(?m)^%s\s*=.*$' % name, k, c)
+            else:
+                c += '\n' + k
+        b = c + '\n\n'
+    out.append(b)
+open(p, 'w', encoding='utf-8').write(
+    '; bashcore-arranque: startretries=10 / startsecs=10.\n'
+    '; 3 reintentos se agotaban antes de que MariaDB estuviera lista.\n'
+    '; "bench setup supervisor" REGENERA este archivo y borra el ajuste.\n'
+    + ''.join(out))
+BCPYSUP
+  chown "${NEW_USER}:${NEW_USER}" "$BC_SUPCONF" 2>/dev/null || true
+  ok "Reintentos de arranque ampliados en supervisor.conf."
+fi
+
+# --- 7.5.4 Unidad que espera a la BD y levanta el grupo de Frappe ----------
+# 'After=mariadb.service' garantiza que systemd LANZÓ MariaDB, no que la base
+# de datos esté lista: tras un apagado sucio, la recuperación de InnoDB tarda
+# decenas de segundos. Esta unidad espera de verdad y luego rearranca el grupo.
+cat > "${USRLOCALBIN}/frappe-boot-wait.sh" <<'BCWAITEOF'
+#!/usr/bin/env bash
+# Generado por bashcore-frappe (FASE 7.5). Red de seguridad de arranque.
+set -u
+LOG=/var/log/frappe-boot.log
+say() { printf '%s  %s\n' "$(date -Is)" "$*" >> "$LOG"; }
+say "=== frappe-boot: inicio ==="
+
+listo=0
+for i in $(seq 1 60); do
+  out="$(mariadb -u __probe__ -p__probe__ -h 127.0.0.1 -e 'SELECT 1' 2>&1)"
+  case "$out" in *"Access denied"*|*"using password"*) listo=1; break ;; esac
+  if [ -S /run/mysqld/mysqld.sock ] || [ -S /var/run/mysqld/mysqld.sock ]; then
+    mariadb-admin --protocol=socket ping >/dev/null 2>&1 && { listo=1; break; }
+  fi
+  sleep 5
+done
+[ "$listo" = "1" ] && say "MariaDB lista." || say "AVISO: MariaDB no respondió en 5 min."
+
+systemctl is-active --quiet supervisor || { say "arranco supervisor"; systemctl start supervisor >/dev/null 2>&1; sleep 5; }
+supervisorctl reread      >>"$LOG" 2>&1
+supervisorctl update      >>"$LOG" 2>&1
+supervisorctl restart all >>"$LOG" 2>&1
+sleep 10
+say "--- estado de supervisor ---"
+supervisorctl status >>"$LOG" 2>&1
+
+if nginx -t >/dev/null 2>&1; then
+  systemctl is-active --quiet nginx || { say "arranco nginx"; systemctl start nginx >>"$LOG" 2>&1; }
+else
+  say "ERROR: nginx -t falla; no arranco nginx:"; nginx -t >>"$LOG" 2>&1
+fi
+
+SITE="$(cat /etc/frappe-boot-site 2>/dev/null || true)"
+if [ -n "$SITE" ]; then
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${SITE}" http://127.0.0.1/ 2>/dev/null)"
+  say "HTTP local para ${SITE}: ${code}"
+fi
+say "=== frappe-boot: fin ==="
+exit 0
+BCWAITEOF
+chmod 750 "${USRLOCALBIN}/frappe-boot-wait.sh"
+printf '%s\n' "$SITE_NAME" > "${ETC}/frappe-boot-site"
+
+cat > "${ETC}/systemd/system/frappe-boot.service" <<BCUNITEOF
+# Generado por bashcore-frappe (FASE 7.5).
+[Unit]
+Description=Frappe: espera a MariaDB y levanta el grupo de Supervisor
+After=network-online.target mariadb.service redis-server.service supervisor.service
+Wants=network-online.target mariadb.service supervisor.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${USRLOCALBIN}/frappe-boot-wait.sh
+TimeoutStartSec=420
+
+[Install]
+WantedBy=multi-user.target
+BCUNITEOF
+
+systemctl daemon-reload || true
+if systemctl enable frappe-boot.service >/dev/null 2>&1; then
+  ok "frappe-boot.service instalada y habilitada."
+else
+  warn "frappe-boot.service no se pudo habilitar."
+fi
+
+# --- 7.5.5 Recordatorio del nodo Proxmox -----------------------------------
+if (( IS_CT )); then
+  warn "CT detectado: si el contenedor no arranca con el nodo, nada de esto"
+  warn "sirve. EN EL HOST Proxmox:  pct set <VMID> --onboot 1"
+fi
+mark_done fase7_arranque
 
 # =============================================================================
 #  VALIDACIÓN FINAL Y LIMPIEZA
@@ -3935,12 +4707,21 @@ check "MariaDB activo"        systemctl is-active --quiet mariadb
 check "Redis activo"          systemctl is-active --quiet redis-server
 check "Nginx activo"          systemctl is-active --quiet nginx
 check "Supervisor activo"     systemctl is-active --quiet supervisor
+# [BASHCORE-ARRANQUE-v1] Un servicio "activo" ahora no dice NADA sobre si
+# volverá tras un reinicio. Lo que fallaba era justo esto.
+check "MariaDB arranca solo"    systemctl is-enabled mariadb
+check "Redis arranca solo"      systemctl is-enabled redis-server
+check "Nginx arranca solo"      systemctl is-enabled nginx
+check "Supervisor arranca solo" systemctl is-enabled supervisor
+check "Unidad frappe-boot"      systemctl is-enabled frappe-boot.service
 check "SSH en puerto ${SSH_PORT}" bash -c "ss -H -tln | grep -q ':${SSH_PORT}[[:space:]]'"
 check "Puerto 80 escuchando"  bash -c "ss -H -tln | grep -q ':80[[:space:]]'"
 check "Directorio del sitio"  test -d "${BENCH_DIR}/sites/${SITE_NAME}"
 check "Login a MariaDB"       mariadb -u root -p"${DB_ROOT_PASS}" -h 127.0.0.1 -e "SELECT 1"
 
-HTTP_CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${SITE_NAME}" http://127.0.0.1/ 2>/dev/null || echo '000')"
+# [v2.2.0] Mismo bug que en el diagnóstico: curl ya emite '000' al fallar.
+HTTP_CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${SITE_NAME}" http://127.0.0.1/ 2>/dev/null)"
+HTTP_CODE="${HTTP_CODE:0:3}"; HTTP_CODE="${HTTP_CODE:-000}"
 VALID_TOTAL=$((VALID_TOTAL+1))
 if [[ "$HTTP_CODE" =~ ^(200|302|303)$ ]]; then
   ok "El sitio responde por HTTP (${HTTP_CODE})"; VALID_OK=$((VALID_OK+1))
@@ -4018,6 +4799,9 @@ $(echo -e "${BOLD}COMANDOS ÚTILES${NC}")
   bash $0 --diag            # empaquetar logs si algo falla
   sudo -u ${NEW_USER} screen -r ${SCREEN_NAME}   # consola de la instalación
   supervisorctl status
+  systemctl is-enabled mariadb redis-server nginx supervisor  # ¿vuelven tras reiniciar?
+  journalctl -u frappe-boot -b --no-pager   # arranque de Frappe en este boot
+  cat /var/log/frappe-boot.log
   sudo -u ${NEW_USER} bash -lc 'cd ${BENCH_DIR} && bench --site ${SITE_NAME} list-apps'
   tail -f ${BENCH_DIR}/logs/worker.error.log
 
