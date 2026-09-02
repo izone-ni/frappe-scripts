@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v2.3.0  (unificado)
+#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v16.0.5
 #  https://github.com/izone-ni/frappe-scripts
 #  Despliegue automatizado + hardening de Frappe 16 / ERPNext 16
 #  Base: Ubuntu 24.04 LTS   Refs: CIS Ubuntu 24.04 v1.0.0, CIS NGINX v3.0.0
@@ -15,6 +15,30 @@
 #  El script detecta el entorno y se adapta. En un CT hay operaciones que el
 #  kernel del host NO delega al contenedor; se detallan en 'AJUSTES EN EL
 #  NODO PROXMOX' al final de esta cabecera.
+#
+#  CAMBIOS v16.0.5 (el asistente de instalación):
+#   [U1] El menú de versiones ofrecía las cuatro ramas en cualquier sistema.
+#        Ahora se construye con las compatibles con el SO detectado; si no hay
+#        ninguna, lo dice y no deja empezar.
+#   [U2] La pregunta 10/10 estaba escrita a mano con las apps de Frappe 16, así
+#        que al instalar la 13 ofrecía HRMS y Lending —que no tienen rama en esa
+#        versión— y el fallo aparecía 40 minutos después, en 'bench get-app'.
+#        El menú se construye ahora desde FV_APPS de la rama elegida.
+#   [U3] Una pregunta por pantalla. Antes se acumulaban los dos menús, la matriz
+#        de compatibilidad y las diez preguntas, y al llegar al resumen no se
+#        veía nada de lo contestado.
+#   [U4] La barra de progreso decía "Frappe 16" instalara lo que instalara.
+#   [U5] Compatibilidad binaria: fuera "probado en / tolerado en / COMBINACIÓN
+#        PROBADA". Si es compatible, sigue sin ruido; si no, explica qué versión
+#        de Python y Node exige la rama y por qué el sistema no las tiene, lista
+#        las versiones que sí sirven y espera Enter (o SEGUIR para forzar).
+#   [U6] Los dos resúmenes —el previo y el final— salen en tabla.
+#   [U7] Una sola cadena de versión, VERSION_SCRIPT. Convivían v2.3.0 en la
+#        cabecera y v1.0.0 en el banner y en el log: por una captura de pantalla
+#        era imposible saber qué versión había corrido.
+#   [U8] '${a^}' imprimía "Erpnext" y "Hrms". Y el rótulo de actividad de una
+#        fase seguía en pantalla durante la siguiente ("instalando dependencias
+#        del entorno" mientras descargaba ERPNext).
 #
 #  CAMBIOS v2.3.0 (nginx habilitado pero incapaz de arrancar):
 #   SÍNTOMA: tras habilitar nginx seguía sin escuchar en el 80. 'nginx -t':
@@ -294,6 +318,11 @@ LOG_FILE="${VARDIR}/log/bashcore-frappe16.log"
 #  CONSTANTES
 # -----------------------------------------------------------------------------
 TIMEZONE="America/Managua"   # valor por defecto; la pregunta 6/10 lo cambia
+# Una sola cadena de versión para TODO el script: cabecera, banner, --help y
+# la línea de inicio del log. Antes había tres valores distintos conviviendo
+# (v2.x en la cabecera, v1.0.0 en el banner) y era imposible saber, mirando
+# una captura de pantalla, qué versión había corrido de verdad.
+VERSION_SCRIPT="v16.0.5"
 # ---------------------------------------------------------------------------
 #  MATRIZ DE COMPATIBILIDAD (verificada contra los repositorios de Frappe)
 #    campos: rama | python | node | mariadb | apps | SO compatibles
@@ -480,6 +509,112 @@ warn()  { echo -e "  ${YELLOW}[WARN]${NC} $*"; printf '\033[2K  \033[1;33m[WARN]
 fail()  { echo -e "  ${RED}[FAIL]${NC} $*";  printf '\033[2K  \033[0;31m[FAIL]\033[0m %b\n' "$*" >&3; CARD_LINES=0; }
 skip()  { echo -e "  ${YELLOW}[SKIP]${NC} $* ${YELLOW}(ya completado)${NC}"; }
 
+# ---------------------------------------------------------------------------
+#  NOMBRES DE APLICACIÓN
+#  '${a^}' producía "Erpnext" y "Hrms". Son marcas: se escriben como se
+#  escriben, y aparecen en el menú, en la barra de progreso y en el resumen.
+# ---------------------------------------------------------------------------
+app_nombre() {
+  case "$1" in
+    erpnext) printf 'ERPNext' ;;
+    hrms)    printf 'HRMS' ;;
+    lending) printf 'Lending' ;;
+    wiki)    printf 'Wiki' ;;
+    *)       printf '%s' "${1^}" ;;
+  esac
+}
+# "erpnext hrms wiki" -> "ERPNext, HRMS, Wiki"
+apps_bonitas() {
+  local a out=""
+  for a in $1; do out+="$(app_nombre "$a"), "; done
+  printf '%s' "${out%, }"
+}
+
+# ---------------------------------------------------------------------------
+#  PANTALLA DEL ASISTENTE
+#  Cada pregunta ocupa la pantalla entera. Antes se acumulaban las diez, más
+#  los dos menús y la matriz de compatibilidad, y al llegar al resumen no se
+#  veía nada de lo que se había contestado.
+#  La limpieza sólo se emite si hay terminal de verdad: en un log o en una
+#  tubería las secuencias de control serían basura ilegible.
+# ---------------------------------------------------------------------------
+limpiar_pantalla() {
+  (( ${HAVE_TTY:-0} == 1 )) && printf '\033[2J\033[3J\033[H' >&3
+  return 0
+}
+banner_izone() {
+  say "
+\033[0;36m\033[1m  ██╗\033[0m███████╗ ██████╗ ███╗   ██╗███████╗
+\033[0;36m\033[1m  ██║\033[0m╚══███╔╝██╔═══██╗████╗  ██║██╔════╝
+\033[0;36m\033[1m  ██║\033[0m  ███╔╝ ██║   ██║██╔██╗ ██║█████╗
+\033[0;36m\033[1m  ██║\033[0m ███╔╝  ██║   ██║██║╚██╗██║██╔══╝
+\033[0;36m\033[1m  ██║\033[0m███████╗╚██████╔╝██║ ╚████║███████╗
+\033[0;36m\033[1m  ╚═╝\033[0m╚══════╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝
+\033[1m       E N T E R P R I S E\033[0m
+"
+  return 0
+}
+
+pantalla() {
+  local titulo="${1:-}"
+  limpiar_pantalla
+  if [[ -n "${EMPRESA:-}" ]]; then
+    banner_empresa "$EMPRESA"
+  else
+    banner_izone
+  fi
+  say "  ${BLUE}${BOLD}iZone Enterprise${NC}  ·  ${VERSION_SCRIPT}"
+  [[ -n "${FRAPPE_VER:-}" ]] && say "  ·  Frappe ${FRAPPE_VER}"
+  say "  ·  $(so_actual)\n"
+  [[ -n "$titulo" ]] && say "  ${BOLD}${titulo}${NC}\n"
+  say "\n"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+#  TABLA DE RESUMEN
+#  Dos columnas de ancho fijo. Se mide en CARACTERES, no en bytes: el locale
+#  ya se fuerza a UTF-8 más arriba, así que los acentos y los caracteres de
+#  marco no descuadran el borde derecho.
+# ---------------------------------------------------------------------------
+TBL_W=68
+TBL_K=20
+tabla_borde() {
+  local izq="$1" der="$2" i linea=""
+  for ((i=0; i<TBL_W-2; i++)); do linea+="$BX_H"; done
+  printf '  \033[0;36m%s%s%s\033[0m\n' "$izq" "$linea" "$der" >&3
+}
+tabla_abre()  { tabla_borde "$BX_TL" "$BX_TR"; }
+tabla_cierra(){ tabla_borde "$BX_BL" "$BX_BR"; }
+tabla_sep() {
+  local i linea="" izq="+" der="+"
+  [[ "$BX_V" == "│" ]] && { izq="├"; der="┤"; }
+  for ((i=0; i<TBL_W-2; i++)); do linea+="$BX_H"; done
+  printf '  \033[0;36m%s%s%s\033[0m\n' "$izq" "$linea" "$der" >&3
+}
+tabla_titulo() {
+  local t="$1" ancho pad
+  ancho=$(( TBL_W - 4 ))
+  (( ${#t} > ancho )) && t="${t:0:ancho}"
+  pad=$(( ancho - ${#t} ))
+  printf '  \033[0;36m%s\033[0m \033[1m%s\033[0m%*s \033[0;36m%s\033[0m\n' \
+         "$BX_V" "$t" "$pad" "" "$BX_V" >&3
+}
+tabla_fila() {
+  # El relleno se calcula con ${#cadena} (CARACTERES) y se emite aparte. Con
+  # '%-20s' printf cuenta BYTES: "Autenticación" ocupa 13 caracteres pero 14
+  # bytes, y esa fila salía desplazada un espacio respecto a las demás.
+  local k="$1" v="$2" ancho libre padk padv
+  ancho=$(( TBL_W - 4 ))
+  libre=$(( ancho - TBL_K - 1 ))
+  (( ${#k} > TBL_K ))  && k="${k:0:TBL_K}"
+  (( ${#v} > libre ))  && v="${v:0:libre-3}..."
+  padk=$(( TBL_K - ${#k} ));  (( padk < 0 )) && padk=0
+  padv=$(( libre - ${#v} ));  (( padv < 0 )) && padv=0
+  printf '  \033[0;36m%s\033[0m \033[2m%s%*s\033[0m %s%*s \033[0;36m%s\033[0m\n' \
+         "$BX_V" "$k" "$padk" "" "$v" "$padv" "" "$BX_V" >&3
+}
+
 # [V2][V3] Evidencia objetiva de avance. El log en silencio NO significa nada:
 # yarn copia decenas de miles de archivos sin imprimir. Lo que sí demuestra
 # progreso es que el árbol de frappe-bench crezca en disco.
@@ -540,11 +675,11 @@ construir_pasos() {
   _paso uv      "Python ${PYTHON_VERSION} (uv)"   3 120
   _paso init    "bench init: núcleo de Frappe"   20 1500
   for a in $apps; do
-    _paso "get_${a}"  "Descarga ${a^}"            3 180
+    _paso "get_${a}"  "Descarga $(app_nombre "$a")"  3 180
   done
   _paso site    "Creación del sitio"              4 300
   for a in $apps; do
-    _paso "inst_${a}" "Instala ${a^}"             5 300
+    _paso "inst_${a}" "Instala $(app_nombre "$a")"   5 300
   done
   _paso migrate "Migraciones"                     3 180
   _paso build   "Compilación de assets"           8 600
@@ -677,6 +812,8 @@ ultima_linea_log() {
 # MariaDB decía "trabajando" y las acciones se colaban como avisos aparte.
 ACTIVIDAD_FILE=""
 actividad() {
+  # Un texto vacío BORRA la actividad. Sin esto, el rótulo de una fase seguía
+  # en pantalla durante la siguiente y contradecía al propio paso en curso.
   ACTIVIDAD_FILE="${STATE_DIR}/actividad"
   printf '%s' "$*" > "$ACTIVIDAD_FILE" 2>/dev/null || true
   return 0
@@ -739,7 +876,7 @@ render_card() {
   _borde "$BX_TL" "$BX_TR"
   # Fila 1: título a la izquierda, estimación a la derecha.
   local sep="·"; [[ "$BX_V" == "|" ]] && sep="-"
-  local tit="Frappe 16 ${sep} ${fase}" der="~${rest} min" hueco
+  local tit="Frappe ${FRAPPE_VER:-16} ${sep} ${fase}" der="~${rest} min" hueco
   hueco=$(( CARD_W - 4 - ${#tit} - ${#der} ))
   (( hueco < 1 )) && { tit="${tit:0:CARD_W-7-${#der}}"; hueco=1; }
   _row "${tit}$(printf '%*s' "$hueco" '')${der}" "\033[1m"
@@ -936,7 +1073,7 @@ while (( $# > 0 )); do
     --reset)  ACTION="reset"  ;;
     -h|--help)
       cat <<AYUDA
-bashcore-frappe16 v2.3.0
+bashcore-frappe  ${VERSION_SCRIPT}
 
   (sin argumentos)   Instala o reanuda el despliegue.
   --status           Muestra los pasos ya completados.
@@ -1162,6 +1299,7 @@ detectar_instalacion() {
 menu_diagnostico() {
   while :; do
     say "\n  ${BOLD}¿Qué quieres diagnosticar?${NC}\n\n"
+    # El diagnóstico NO limpia: su valor está en poder comparar bloques.
     say "    ${BOLD}1${NC}) Todo (informe completo)\n"
     say "    ${BOLD}2${NC}) Servicios del sistema (MariaDB, Redis, Nginx, Supervisor, SSH)\n"
     say "    ${BOLD}3${NC}) Puertos a la escucha\n"
@@ -1477,50 +1615,103 @@ aplicar_version() {
   construir_pasos
 }
 
-# Comprueba el sistema operativo REAL contra la matriz de la versión elegida.
-validar_so() {
+# Compatibilidad: o la combinación está soportada o no lo está. La distinción
+# entre "probado" y "tolerado" era ruido para quien instala: ninguna de las dos
+# cambiaba lo que el script hacía a continuación.
+so_compatible() {   # versión de Frappe · devuelve 0 si el SO actual sirve
   local v="$1" so; so="$(so_actual)"
-  say "\n  Sistema detectado: ${BOLD}${so}${NC}\n"
-  say "  Frappe ${v} · probado en: ${FV_SO_OK[$v]}\n"
-  [[ -n "${FV_SO_AVISO[$v]:-}" ]] && say "                 · tolerado en: ${FV_SO_AVISO[$v]}\n"
-  case " ${FV_SO_OK[$v]} " in
-    *" ${so} "*) say "  ${GREEN}COMPATIBLE${NC}: combinación probada.\n\n"; return 0 ;;
+  case " ${FV_SO_OK[$v]} ${FV_SO_AVISO[$v]:-} " in
+    *" ${so} "*) return 0 ;;
   esac
-  case " ${FV_SO_AVISO[$v]:-} " in
-    *" ${so} "*)
-      say "  ${YELLOW}NO VALIDADO${NC}: debería funcionar, pero no está probado.\n"
-      if ask_yn "¿Continuar de todas formas?" n; then say "\n"; return 0; fi
-      return 1 ;;
-  esac
-  say "  ${RED}INCOMPATIBLE${NC}: Frappe ${v} no se instala en ${so}.\n"
-  local otra
+  return 1
+}
+
+# Sólo se invoca como red de seguridad: el menú ya filtra por sistema. Explica
+# POR QUÉ no es compatible antes de pedir confirmación, en vez de limitarse a
+# rechazar la elección.
+validar_so() {
+  local v="$1" so otra alternativas="" _r
+  so="$(so_actual)"
+  so_compatible "$v" && return 0
+
+  pantalla "Combinación no compatible"
+  say "  ${RED}${BOLD}Frappe ${v} no es compatible con ${so}.${NC}\n\n"
+  say "  Frappe ${v} declara ${BOLD}Python ${FV_PYTHON[$v]}${NC} y ${BOLD}Node ${FV_NODE[$v]}${NC} en su\n"
+  say "  pyproject.toml y su package.json. En ${so} esas versiones no están\n"
+  say "  disponibles en los repositorios, así que 'bench init' fallaría al\n"
+  say "  construir el entorno virtual, o los assets no compilarían.\n\n"
+  say "  Sistemas soportados por Frappe ${v}: ${BOLD}${FV_SO_OK[$v]} ${FV_SO_AVISO[$v]:-}${NC}\n\n"
   for otra in 16 15 14 13; do
-    case " ${FV_SO_OK[$otra]} ${FV_SO_AVISO[$otra]:-} " in
-      *" ${so} "*) say "  En este sistema sí puedes instalar ${BOLD}Frappe ${otra}${NC}.\n" ;;
-    esac
+    [[ "$otra" == "$v" ]] && continue
+    so_compatible "$otra" && alternativas+="${otra} "
   done
-  say "\n"
+  if [[ -n "$alternativas" ]]; then
+    say "  En ${so} sí puedes instalar: ${GREEN}${BOLD}Frappe ${alternativas% }${NC}\n\n"
+  fi
+  say "  Pulsa ${BOLD}Enter${NC} para elegir otra versión, o escribe ${BOLD}SEGUIR${NC} para\n"
+  say "  instalar de todas formas bajo tu responsabilidad: "
+  read -r _r || _r=""
+  if [[ "$(trim "${_r^^}")" == "SEGUIR" ]]; then
+    warn "Instalación FORZADA de Frappe ${v} sobre ${so} a petición del operador."
+    return 0
+  fi
   return 1
 }
 
 menu_version() {
+  local so v i op; so="$(so_actual)"
+  local -a compatibles=()
+  for v in 16 15 14 13; do
+    so_compatible "$v" && compatibles+=("$v")
+  done
+
+  # Ningún Frappe soportado en este sistema: decirlo claro y volver, en lugar
+  # de ofrecer cuatro opciones que van a fallar todas.
+  if (( ${#compatibles[@]} == 0 )); then
+    pantalla "Sistema no soportado"
+    say "  ${RED}${BOLD}Ninguna versión de Frappe es compatible con ${so}.${NC}\n\n"
+    say "  Este script soporta:\n"
+    for v in 16 15 14 13; do
+      say "    Frappe ${v}  ·  ${FV_SO_OK[$v]} ${FV_SO_AVISO[$v]:-}\n"
+    done
+    say "\n  Instala sobre uno de esos sistemas. Pulsa ${BOLD}Enter${NC} para volver: "
+    read -r _ || true
+    return 1
+  fi
+
+  # 'T' existe para las pruebas de laboratorio: permite elegir una rama que la
+  # matriz no da por compatible. No es un atajo silencioso — al elegirla,
+  # validar_so explica el porqué y exige escribir SEGUIR.
+  local -a listadas=()
+  local todas=0
   while :; do
-    say "\n  ${BOLD}¿Qué versión de Frappe quieres instalar?${NC}\n\n"
-    say "    ${BOLD}1${NC}) Frappe 16  · Python 3.14 · Node 24 · ERPNext, HRMS, Lending, Wiki\n"
-    say "    ${BOLD}2${NC}) Frappe 15  · Python 3.11 · Node 20 · ERPNext, HRMS, Lending, Wiki\n"
-    say "    ${BOLD}3${NC}) Frappe 14  · Python 3.10 · Node 16 · ERPNext, HRMS, Wiki\n"
-    say "    ${BOLD}4${NC}) Frappe 13  · Python 3.9  · Node 14 · ERPNext, Wiki\n"
-    say "    ${BOLD}0${NC}) Volver\n\n  > "
-    local op; read -r op || op=0
-    case "$(trim "${op}")" in
-      1) aplicar_version 16 ;;
-      2) aplicar_version 15 ;;
-      3) aplicar_version 14 ;;
-      4) aplicar_version 13 ;;
+    if (( todas )); then listadas=(16 15 14 13); else listadas=("${compatibles[@]}"); fi
+    pantalla "Versión de Frappe a instalar"
+    i=1
+    for v in "${listadas[@]}"; do
+      say "    ${BOLD}${i}${NC}) Frappe ${v}  · Python ${FV_PYTHON[$v]} · Node ${FV_NODE[$v]} · $(apps_bonitas "${FV_APPS[$v]}")"
+      so_compatible "$v" || say "  ${RED}(no compatible con ${so})${NC}"
+      say "\n"
+      i=$((i+1))
+    done
+    say "    ${BOLD}0${NC}) Volver\n\n"
+    if (( todas )); then
+      say "  Mostrando ${BOLD}todas${NC} las ramas. Las marcadas en rojo pedirán confirmación.\n\n  > "
+    else
+      say "  Sólo versiones compatibles con ${BOLD}${so}${NC}. Escribe ${BOLD}T${NC} para ver todas.\n\n  > "
+    fi
+    read -r op || op=0
+    op="$(trim "${op}")"
+    case "${op^^}" in
       0) return 1 ;;
-      *) say "  ${RED}Opción no válida.${NC}\n"; continue ;;
+      T) todas=1; continue ;;
     esac
-    if validar_so "$FRAPPE_VER"; then return 0; fi
+    if [[ "$op" =~ ^[0-9]+$ ]] && (( op >= 1 && op <= ${#listadas[@]} )); then
+      aplicar_version "${listadas[$((op-1))]}"
+      if validar_so "$FRAPPE_VER"; then return 0; fi
+    else
+      say "  ${RED}Opción no válida.${NC}\n"; sleep 1
+    fi
   done
 }
 
@@ -1954,7 +2145,7 @@ fi
 
 menu_principal() {
   while :; do
-    say "\n  ${BOLD}¿Qué quieres hacer?${NC}\n\n"
+    pantalla "¿Qué quieres hacer?"
     say "    ${BOLD}1${NC}) Instalar      · despliegue limpio con hardening CIS\n"
     say "    ${BOLD}2${NC}) Diagnóstico   · estado de servicios, sitio y errores\n"
     say "    ${BOLD}3${NC}) Reparar       · el sitio no vuelve tras reiniciar (no reinstala)\n"
@@ -2003,19 +2194,10 @@ touch "$LOG_FILE"; chmod 600 "$LOG_FILE"
 # sigue conteniendo todo, que es la fuente de verdad ante cualquier fallo.
 exec >> "$LOG_FILE" 2>&1
 
-say "
-\033[0;36m\033[1m  ██╗\033[0m███████╗ ██████╗ ███╗   ██╗███████╗
-\033[0;36m\033[1m  ██║\033[0m╚══███╔╝██╔═══██╗████╗  ██║██╔════╝
-\033[0;36m\033[1m  ██║\033[0m  ███╔╝ ██║   ██║██╔██╗ ██║█████╗
-\033[0;36m\033[1m  ██║\033[0m ███╔╝  ██║   ██║██║╚██╗██║██╔══╝
-\033[0;36m\033[1m  ██║\033[0m███████╗╚██████╔╝██║ ╚████║███████╗
-\033[0;36m\033[1m  ╚═╝\033[0m╚══════╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝
-\033[1m       E N T E R P R I S E\033[0m
-        Frappe 16 · ERPNext · HRMS · Lending · Wiki
-        Ubuntu 24.04 LTS · CIS Hardening · v1.0.0
-
-"
-echo -e "\n### iZone install_frappe16 v1.0.0 | Inicio: $(date -Is) | PID $$ ###"
+banner_izone
+say "        Frappe 16 · 15 · 14 · 13   ·   ERPNext · HRMS · Lending · Wiki\n"
+say "        $(so_actual) · CIS Hardening · ${VERSION_SCRIPT}\n\n"
+echo -e "\n### iZone bashcore-frappe ${VERSION_SCRIPT} | Inicio: $(date -Is) | PID $$ ###"
 [[ -n "$BC_PREFIX" ]] && warn "MODO PRUEBAS: todas las rutas bajo ${BC_PREFIX}"
 
 phase "FASE 0: VERIFICACIONES PREVIAS"
@@ -2142,9 +2324,10 @@ ok "Se instalará Frappe ${FRAPPE_VER} (${FRAPPE_BRANCH})."
 while :; do
 
 phase "PARÁMETROS DE DESPLIEGUE (10 preguntas)"
-say "${YELLOW}Tras responder estas 10 preguntas el script es 100% desatendido.${NC}\n\n"
 
 # --- 1) Nombre de la empresa -------------------------------------------------
+pantalla "Parámetros del despliegue  ·  1 de 10"
+say "${YELLOW}Tras responder estas 10 preguntas el script es 100% desatendido.${NC}\n\n"
 say "${BOLD}1/10${NC} Nombre de la empresa (aparecerá en el encabezado): "
 while :; do
   read -r EMPRESA
@@ -2160,8 +2343,8 @@ while :; do
   esac
   break
 done
-say "\n"
-banner_empresa "$EMPRESA"
+# El banner de la empresa pasa a la cabecera de cada pantalla: se ve en las
+# nueve preguntas siguientes en lugar de aparecer y desaparecer aquí.
 
 # --- 2) Usuario operativo ----------------------------------------------------
 # En un servidor ya en uso suele existir un usuario administrativo en el grupo
@@ -2179,7 +2362,8 @@ if [[ -n "$SUGERENCIA" ]]; then
   info "Usuarios con sudo detectados: ${SUDO_USERS}"
 fi
 
-
+pantalla "Parámetros del despliegue  ·  2 de 10"
+[[ -n "$SUGERENCIA" ]] && say "  Usuarios con sudo detectados: ${BOLD}${SUDO_USERS}${NC}\n\n"
 while :; do
   if [[ -n "$SUGERENCIA" ]]; then
   say "${BOLD}2/10${NC} Usuario operativo (se crea si no existe; ej: sysadmin) [${BOLD}${SUGERENCIA}${NC}]: "
@@ -2206,6 +2390,7 @@ done
 # --- 3) Contraseña del usuario operativo [F4] --------------------------------
 # Se pregunta explícitamente: es la clave que usarás para 'sudo'. El acceso
 # SSH seguirá siendo SÓLO por llave (PasswordAuthentication no).
+pantalla "Parámetros del despliegue  ·  3 de 10"
 if id "$NEW_USER" &>/dev/null; then
   say "\n${BOLD}3/10${NC} '${NEW_USER}' YA EXISTE. Escribe SU contraseña actual (o la nueva\n"
   say "      que quieras dejarle: se aplicará al usuario existente)\n"
@@ -2232,6 +2417,7 @@ unset OS_USER_PASS2
 ok "Contraseña del usuario aceptada (${#OS_USER_PASS} caracteres)."
 
 # --- 4) Llave pública SSH ----------------------------------------------------
+pantalla "Parámetros del despliegue  ·  4 de 10"
 say "\n${BOLD}4/10${NC} Llave pública SSH para '${NEW_USER}' (una sola línea)\n"
 while :; do
   say "     > "
@@ -2262,6 +2448,7 @@ while :; do
 done
 
 # --- 5) Puerto SSH -----------------------------------------------------------
+pantalla "Parámetros del despliegue  ·  5 de 10"
 while :; do
   say "\n${BOLD}5/10${NC} Puerto SSH personalizado (ej: 2222): "
   read -r SSH_PORT
@@ -2287,6 +2474,7 @@ while :; do
 done
 
 # --- 6) Password de root de MariaDB ------------------------------------------
+pantalla "Parámetros del despliegue  ·  6 de 10"
 say "\n${BOLD}6/10${NC} Contraseña para 'root' de MariaDB (mín. 12 caracteres)\n"
 while :; do
   say "     Contraseña: "; read -rs DB_ROOT_PASS; say "\n"
@@ -2308,6 +2496,7 @@ unset DB_ROOT_PASS2
 ok "Contraseña de MariaDB aceptada (${#DB_ROOT_PASS} caracteres)."
 
 # --- 7) Zona horaria ---------------------------------------------------------
+pantalla "Parámetros del despliegue  ·  7 de 10"
 say "\n${BOLD}7/10${NC} Zona horaria [${BOLD}America/Managua${NC}]: "
 while :; do
   read -r TZ_IN
@@ -2325,6 +2514,7 @@ done
 ok "Zona horaria: ${TIMEZONE}"
 
 # --- 8) Contraseña del Administrator de Frappe [F4] -------------------------
+pantalla "Parámetros del despliegue  ·  8 de 10"
 say "\n${BOLD}8/10${NC} Contraseña del usuario 'Administrator' de Frappe (mín. 12)\n"
 while :; do
   say "     Contraseña: "; read -rs ADMIN_PASS; say "\n"
@@ -2345,6 +2535,7 @@ unset ADMIN_PASS2
 ok "Contraseña de Administrator aceptada (${#ADMIN_PASS} caracteres)."
 
 # --- 9) Nombre del sitio -----------------------------------------------------
+pantalla "Parámetros del despliegue  ·  9 de 10"
 while :; do
   say "\n${BOLD}9/10${NC} Nombre del sitio Frappe (ej: misitio.com): "
   read -r SITE_NAME
@@ -2360,29 +2551,46 @@ while :; do
 done
 
 # --- 10) Aplicaciones a instalar ---------------------------------------------
-say "\n${BOLD}10/10${NC} ¿Qué aplicaciones quieres instalar?\n"
-say "      ${BOLD}1${NC}) Todas: ERPNext + HRMS + Lending + Wiki   ${BOLD}(recomendado)${NC}\n"
-say "      ${BOLD}2${NC}) Las tres principales: ERPNext + HRMS + Lending\n"
-say "      ${BOLD}3${NC}) Sólo ERPNext\n"
-say "      ${BOLD}4${NC}) Sólo HRMS\n"
-say "      ${BOLD}5${NC}) Sólo Lending\n"
-say "      ${BOLD}6${NC}) Sólo Wiki\n"
-say "      ${BOLD}7${NC}) Ninguna: sólo el framework Frappe\n"
+# El menú se CONSTRUYE con las apps que existen para la rama elegida. Antes
+# estaba escrito a mano con las cuatro de Frappe 16, así que al instalar la 13
+# ofrecía HRMS y Lending, que no tienen rama en esa versión: el despliegue
+# llegaba hasta 'bench get-app' y fallaba allí, 40 minutos después.
+pantalla "Parámetros del despliegue  ·  10 de 10"
+say "${BOLD}10/10${NC} ¿Qué aplicaciones quieres instalar? (Frappe ${FRAPPE_VER})\n\n"
+
+OPC_ETIQ=(); OPC_VAL=()
+_opc_app() { OPC_ETIQ+=("$1"); OPC_VAL+=("$2"); }
+
+_opc_app "Todas: $(apps_bonitas "$APPS_DISPONIBLES")   ${BOLD}(recomendado)${NC}" "$APPS_DISPONIBLES"
+
+# "Sin Wiki" sólo tiene sentido si Wiki está y queda más de una app detrás.
+APPS_SIN_WIKI=""
+for _a in $APPS_DISPONIBLES; do
+  [[ "$_a" == "wiki" ]] && continue
+  APPS_SIN_WIKI+="${_a} "
+done
+APPS_SIN_WIKI="$(trim "$APPS_SIN_WIKI")"
+if [[ "$APPS_SIN_WIKI" != "$APPS_DISPONIBLES" && "$APPS_SIN_WIKI" == *" "* ]]; then
+  _opc_app "Sin Wiki: $(apps_bonitas "$APPS_SIN_WIKI")" "$APPS_SIN_WIKI"
+fi
+for _a in $APPS_DISPONIBLES; do
+  _opc_app "Sólo $(app_nombre "$_a")" "$_a"
+done
+_opc_app "Ninguna: sólo el framework Frappe" ""
+
+for _i in "${!OPC_ETIQ[@]}"; do
+  say "      ${BOLD}$((_i+1))${NC}) ${OPC_ETIQ[$_i]}\n"
+done
 while :; do
-  say "      > "
+  say "\n      > "
   read -r APPS_OPT
   APPS_OPT="$(trim "$APPS_OPT")"
-  case "$APPS_OPT" in
-    1|"") APPS_SEL="erpnext hrms lending wiki" ;;
-    2)    APPS_SEL="erpnext hrms lending" ;;
-    3)    APPS_SEL="erpnext" ;;
-    4)    APPS_SEL="hrms" ;;
-    5)    APPS_SEL="lending" ;;
-    6)    APPS_SEL="wiki" ;;
-    7)    APPS_SEL="" ;;
-    *)    fail "Elige un número del 1 al 7."; continue ;;
-  esac
-  break
+  [[ -z "$APPS_OPT" ]] && APPS_OPT=1
+  if [[ "$APPS_OPT" =~ ^[0-9]+$ ]] && (( APPS_OPT >= 1 && APPS_OPT <= ${#OPC_ETIQ[@]} )); then
+    APPS_SEL="${OPC_VAL[$((APPS_OPT-1))]}"
+    break
+  fi
+  fail "Elige un número del 1 al ${#OPC_ETIQ[@]}."
 done
 # HRMS depende de ERPNext: Frappe no lo instala sin él.
 case " ${APPS_SEL} " in
@@ -2418,22 +2626,28 @@ umask 022
 ok "Metadatos del despliegue en ${CRED_FILE} (0600, sin contraseñas)."
 
 # --- Resumen y confirmación única -------------------------------------------
+pantalla ""
+tabla_abre
+tabla_titulo "RESUMEN DE LA OPERACIÓN"
+tabla_sep
+tabla_fila "Empresa"          "${EMPRESA}"
+tabla_fila "Sistema"          "$(so_actual)"
+tabla_fila "Frappe"           "${FRAPPE_BRANCH}"
+tabla_fila "Aplicaciones"     "$(apps_bonitas "${APPS_SEL}")"
+tabla_fila "Sitio"            "${SITE_NAME}"
+tabla_sep
+tabla_fila "Usuario operativo" "${NEW_USER}"
+tabla_fila "Puerto SSH"       "${SSH_PORT}   (el 22 quedará CERRADO)"
+tabla_fila "Autenticación"    "sólo llave pública (password OFF, root OFF)"
+tabla_fila "Zona horaria"     "${TIMEZONE}"
+tabla_sep
+tabla_fila "MariaDB"          "${MARIADB_VERSION}, bind 127.0.0.1"
+tabla_fila "Node / Python"    "${NODE_VERSION} / ${PYTHON_VERSION}"
+tabla_fila "Bench"            "${BENCH_DIR}"
+tabla_fila "Contraseñas"      "las tuyas (no se guardan en disco)"
+tabla_fila "Metadatos"        "${CRED_FILE}"
+tabla_cierra
 say "
-$(echo -e "${BOLD}RESUMEN DE LA OPERACIÓN${NC}")
-  Empresa .............: ${EMPRESA}
-  Usuario operativo ...: ${NEW_USER}
-  Puerto SSH ..........: ${SSH_PORT}   (el 22 quedará CERRADO)
-  Autenticación SSH ...: solo llave pública (password OFF, root OFF)
-  Zona horaria ........: ${TIMEZONE}
-  MariaDB .............: ${MARIADB_VERSION}, bind 127.0.0.1
-  Node / Python .......: ${NODE_VERSION} / ${PYTHON_VERSION}
-  Frappe ..............: ${FRAPPE_BRANCH}
-  Sitio ...............: ${SITE_NAME}
-  Aplicaciones ........: ${APPS_SEL:-sólo el framework}
-  Bench ...............: ${BENCH_DIR}
-  Contraseñas .........: definidas por ti (no se guardan en disco)
-  Metadatos ...........: ${CRED_FILE}
-
 $(echo -e "${RED}${BOLD}ADVERTENCIA CRÍTICA${NC}")
   1) SSH se moverá al puerto ${SSH_PORT}. Ábrelo en el firewall de tu
      proveedor (Security Group / Cloud Firewall) ANTES de continuar.
@@ -2451,7 +2665,8 @@ case "$CONFIRM" in
     ok "Confirmado. Comienza el despliegue."
     # El detalle va sólo al log: sin este aviso, la pantalla parecería muerta
     # durante los primeros minutos de 'apt'.
-    say "\n  Iniciando. El detalle completo queda en ${LOG_FILE}\n"
+    pantalla "Desplegando Frappe ${FRAPPE_VER}"
+    say "  Iniciando. El detalle completo queda en ${LOG_FILE}\n"
     say "  En pantalla verás sólo la barra de progreso y los avisos.\n\n"
     break ;;
   SALIR|EXIT|CANCELAR|Q)
@@ -4233,6 +4448,7 @@ else
   info "Preparando la ejecución como '${NEW_USER}'..."
   say "${YELLOW}  bench init + get-app + install-app: 20-45 min.\n"
   say "  Se ejecuta desacoplado: puedes cerrar la sesión sin romper nada.${NC}\n\n"
+  actividad ""   # la fase de usuario informa por su propio log
   launch_user_phase
   if monitor_user_phase; then
     mark_done fase456
@@ -4766,10 +4982,27 @@ say "\n"
 # =============================================================================
 SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 
-echo -e "\n${GREEN}${BOLD}=============================================================="
-echo -e "  DESPLIEGUE DE FRAPPE 16 FINALIZADO  (${VALID_OK}/${VALID_TOTAL} validaciones OK)"
-echo -e "==============================================================${NC}"
-echo "  Metadatos en: ${CRED_FILE}  (las contraseñas no se escriben en disco)"
+echo -e "\n### DESPLIEGUE DE FRAPPE ${FRAPPE_VER} FINALIZADO (${VALID_OK}/${VALID_TOTAL}) ###"
+
+say "\n"
+tabla_abre
+tabla_titulo "DESPLIEGUE DE FRAPPE ${FRAPPE_VER} FINALIZADO"
+tabla_sep
+tabla_fila "Validaciones"     "${VALID_OK}/${VALID_TOTAL} correctas"
+tabla_fila "Empresa"          "${EMPRESA}"
+tabla_fila "Sistema"          "$(so_actual)"
+tabla_fila "Frappe"           "${FRAPPE_BRANCH}"
+tabla_fila "Aplicaciones"     "$( [[ -f "${USER_HOME}/.bashcore_apps" ]] && apps_bonitas "$(tr '\n' ' ' < "${USER_HOME}/.bashcore_apps")" || apps_bonitas "${APPS_SEL}" )"
+tabla_sep
+tabla_fila "Sitio"            "http://${SITE_NAME}/"
+tabla_fila "IP del servidor"  "${SERVER_IP:-?}"
+tabla_fila "Usuario de la app" "Administrator"
+tabla_sep
+tabla_fila "Acceso SSH"       "ssh -p ${SSH_PORT} ${NEW_USER}@${SERVER_IP}"
+tabla_fila "Bench"            "${BENCH_DIR}"
+tabla_fila "Log completo"     "${LOG_FILE}"
+tabla_fila "Metadatos"        "${CRED_FILE}"
+tabla_cierra
 
 say "
 $(echo -e "${BOLD}ACCESO AL SERVIDOR${NC}")
