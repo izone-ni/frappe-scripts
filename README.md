@@ -12,7 +12,7 @@ Destaca por su compatibilidad nativa para instalar **Frappe 16 sobre Ubuntu 26.0
 
 ---
 
-## Uso Rápido
+## Instalador
 
 En un servidor Ubuntu recién instalado, accede como `root` y ejecuta el script principal. Puedes descargar y lanzar el instalador en un solo paso:
 
