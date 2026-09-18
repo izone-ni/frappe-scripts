@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v16.0.5
+#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v16.0.6
 #  https://github.com/izone-ni/frappe-scripts
 #  Despliegue automatizado + hardening de Frappe 16 / ERPNext 16
 #  Base: Ubuntu 24.04 LTS   Refs: CIS Ubuntu 24.04 v1.0.0, CIS NGINX v3.0.0
@@ -15,6 +15,34 @@
 #  El script detecta el entorno y se adapta. En un CT hay operaciones que el
 #  kernel del host NO delega al contenedor; se detallan en 'AJUSTES EN EL
 #  NODO PROXMOX' al final de esta cabecera.
+#
+#  CAMBIOS v16.0.6 (contraseñas con cualquier carácter):
+#   Las tres preguntas de contraseña rechazaban comillas, backslash, backtick,
+#   '$', ':' y espacios. No era prudencia de más: sin arreglar antes a QUIEN
+#   consume la contraseña, aceptarlas rompe la instalación.
+#   [C1] .bashcore.env se escribía como VAR='${VAR}'. Una comilla simple
+#        partía la asignación y el 'source' de la fase de usuario ejecutaba el
+#        resto de la línea como código: no era sólo un fallo, era ejecución
+#        arbitraria a partir de una contraseña. Ahora cada valor pasa por
+#        sh_quote() ('\'' para la comilla), el único entrecomillado que no
+#        reinterpreta nada.
+#   [C2] El hardening SQL insertaba PASSWORD('${DB_ROOT_PASS}'): una comilla o
+#        un backslash partían la sentencia. Ahora entra por sql_quote() y el
+#        archivo fija el sql_mode de la sesión, para que el escape con
+#        backslash sea determinista aunque el servidor traiga
+#        NO_BACKSLASH_ESCAPES.
+#   [C3] Quitadas las tres listas de caracteres prohibidos. Sólo queda el
+#        mínimo de 12 y la confirmación. Los espacios al principio o al final
+#        se avisan —son invisibles— pero se aceptan.
+#   [C4] El ':' de chpasswd nunca fue un problema: parte por el PRIMER ':',
+#        así que la contraseña se aplica entera.
+#   [C5] El enmascarado del paquete --diag usaba la contraseña como expresión
+#        regular en grep y sed. Con un '.' o un '*' podía no encontrarla y
+#        dejarla escrita en el .tar.gz. Ahora la búsqueda es literal.
+#
+#   Sin tocar: 'mariadb -p"$DB_ROOT_PASS"' y el array NS_ARGS ya eran seguros
+#   para cualquier carácter, porque son argumentos entrecomillados y en este
+#   script no hay un solo 'eval'.
 #
 #  CAMBIOS v16.0.5 (el asistente de instalación):
 #   [U1] El menú de versiones ofrecía las cuatro ramas en cualquier sistema.
@@ -322,7 +350,7 @@ TIMEZONE="America/Managua"   # valor por defecto; la pregunta 6/10 lo cambia
 # la línea de inicio del log. Antes había tres valores distintos conviviendo
 # (v2.x en la cabecera, v1.0.0 en el banner) y era imposible saber, mirando
 # una captura de pantalla, qué versión había corrido de verdad.
-VERSION_SCRIPT="v16.0.5"
+VERSION_SCRIPT="v16.0.6"
 # ---------------------------------------------------------------------------
 #  MATRIZ DE COMPATIBILIDAD (verificada contra los repositorios de Frappe)
 #    campos: rama | python | node | mariadb | apps | SO compatibles
@@ -508,6 +536,33 @@ info()  { echo -e "  ${BLUE}[INFO]${NC} $*"; }
 warn()  { echo -e "  ${YELLOW}[WARN]${NC} $*"; printf '\033[2K  \033[1;33m[WARN]\033[0m %b\n' "$*" >&3; CARD_LINES=0; }
 fail()  { echo -e "  ${RED}[FAIL]${NC} $*";  printf '\033[2K  \033[0;31m[FAIL]\033[0m %b\n' "$*" >&3; CARD_LINES=0; }
 skip()  { echo -e "  ${YELLOW}[SKIP]${NC} $* ${YELLOW}(ya completado)${NC}"; }
+
+# ---------------------------------------------------------------------------
+#  ENTRECOMILLADO DE SECRETOS  [v16.0.6]
+#  Las contraseñas las escribe una persona y pueden traer cualquier símbolo.
+#  El script las mueve por dos caminos que NO son a prueba de comillas:
+#  un archivo .env que la fase de usuario hace 'source', y un archivo .sql.
+#  Estas dos funciones son las que permiten aceptar cualquier carácter.
+# ---------------------------------------------------------------------------
+
+# Valor listo para un archivo que se va a 'source' en un shell POSIX.
+# La comilla simple se cierra, se escapa una suelta y se reabre:  '\''
+# Es el único entrecomillado que no interpreta NADA de lo que envuelve.
+sh_quote() {
+  local s="$1" q="'"
+  s="${s//$q/$q\\$q$q}"
+  printf '%s%s%s' "$q" "$s" "$q"
+}
+
+# Valor listo para una cadena literal de SQL, CON sus comillas.
+# El orden importa: primero los backslashes (si no, se escaparían también los
+# que introduce el segundo paso) y después las comillas simples.
+sql_quote() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\'/\\\'}"
+  printf "'%s'" "$s"
+}
 
 # ---------------------------------------------------------------------------
 #  NOMBRES DE APLICACIÓN
@@ -1195,9 +1250,29 @@ if [[ "$ACTION" == "diag" ]]; then
   cp "${ETC}/ssh/sshd_config.d/99-custom.conf" "${DIAG_DIR}/10-config/" 2>/dev/null || true
 
   # Red de seguridad: si alguna contraseña se filtró a un log, se enmascara.
-  if [[ -n "${DB_ROOT_PASS:-}" ]]; then
-    grep -rl "$DB_ROOT_PASS" "$DIAG_DIR" 2>/dev/null | while read -r f; do
-      sed -i "s/${DB_ROOT_PASS}/***OCULTA***/g" "$f" 2>/dev/null || true
+  # [v16.0.6] 'grep' y 'sed' interpretaban la contraseña como expresión
+  # regular: con un '.' o un '*' dentro podía no encontrarla —y dejarla en el
+  # paquete— o sustituir de más. La búsqueda ahora es literal.
+  if [[ -n "${DB_ROOT_PASS:-}" ]] && command -v python3 >/dev/null 2>&1; then
+    BC_DIAG_DIR="$DIAG_DIR" BC_SECRETO="$DB_ROOT_PASS" python3 - <<'PYMASK' 2>/dev/null || true
+import os, pathlib
+raiz = pathlib.Path(os.environ["BC_DIAG_DIR"])
+secreto = os.environ["BC_SECRETO"]
+if secreto:
+    for f in raiz.rglob("*"):
+        if not f.is_file():
+            continue
+        try:
+            t = f.read_text(encoding="utf-8", errors="surrogateescape")
+        except Exception:
+            continue
+        if secreto in t:
+            f.write_text(t.replace(secreto, "***OCULTA***"),
+                         encoding="utf-8", errors="surrogateescape")
+PYMASK
+  elif [[ -n "${DB_ROOT_PASS:-}" ]]; then
+    grep -rlF -- "$DB_ROOT_PASS" "$DIAG_DIR" 2>/dev/null | while read -r f; do
+      BC_S="$DB_ROOT_PASS" perl -pi -e 's/\Q$ENV{BC_S}\E/***OCULTA***/g' "$f" 2>/dev/null || true
     done
   fi
   # Cualquier cosa con aspecto de credencial en los .json de sitios queda fuera.
@@ -2396,6 +2471,7 @@ if id "$NEW_USER" &>/dev/null; then
   say "      que quieras dejarle: se aplicará al usuario existente)\n"
 else
   say "\n${BOLD}3/10${NC} Contraseña para el usuario NUEVO '${NEW_USER}' (mín. 12 caracteres)\n"
+  say "      Se admite cualquier símbolo, incluidas comillas y espacios.\n"
 fi
 while :; do
   say "     Contraseña: "; read -rs OS_USER_PASS; say "\n"
@@ -2406,13 +2482,16 @@ while :; do
   if (( ${#OS_USER_PASS} < 12 )); then
     fail "Mínimo 12 caracteres (tienes ${#OS_USER_PASS})."; continue
   fi
-  # 'chpasswd' usa ':' como separador y no admite saltos de línea.
-  case "$OS_USER_PASS" in
-    *:*)   fail "No puede contener ':' (lo usa chpasswd como separador)."; continue ;;
-    *\ *)  fail "Evita los espacios."; continue ;;
-  esac
+  # [v16.0.6] Cualquier carácter vale. 'chpasswd' parte por el PRIMER ':',
+  # así que una contraseña con ':' se aplica entera; los espacios nunca
+  # fueron un problema para chpasswd. La única imposible sería un salto de
+  # línea, y 'read' no lo deja escribir.
   break
 done
+  if [[ "$OS_USER_PASS" != "$(trim "$OS_USER_PASS")" ]]; then
+    warn "Tu contraseña empieza o termina con espacios. Se acepta tal cual,"
+    warn "pero recuérdalo al escribirla: no se ven."
+  fi
 unset OS_USER_PASS2
 ok "Contraseña del usuario aceptada (${#OS_USER_PASS} caracteres)."
 
@@ -2476,6 +2555,7 @@ done
 # --- 6) Password de root de MariaDB ------------------------------------------
 pantalla "Parámetros del despliegue  ·  6 de 10"
 say "\n${BOLD}6/10${NC} Contraseña para 'root' de MariaDB (mín. 12 caracteres)\n"
+say "      Se admite cualquier símbolo, incluidas comillas y espacios.\n"
 while :; do
   say "     Contraseña: "; read -rs DB_ROOT_PASS; say "\n"
   say "     Confirmar : "; read -rs DB_ROOT_PASS2; say "\n"
@@ -2485,13 +2565,15 @@ while :; do
   if (( ${#DB_ROOT_PASS} < 12 )); then
     fail "Mínimo 12 caracteres (tienes ${#DB_ROOT_PASS})."; continue
   fi
-  # Estos metacaracteres rompen el SQL y los heredocs.
-  case "$DB_ROOT_PASS" in
-    *\'*|*\"*|*\\*|*\`*|*\$*|*' '*)
-      fail "Sin comilla simple, comilla doble, backslash, backtick, \$ ni espacios."; continue ;;
-  esac
+  # [v16.0.6] Cualquier carácter vale: el SQL entra por sql_quote y el .env
+  # por sh_quote. La conexión se hace con  mariadb -p"$DB_ROOT_PASS"  (un
+  # argumento entrecomillado), que nunca reinterpreta el contenido.
   break
 done
+  if [[ "$DB_ROOT_PASS" != "$(trim "$DB_ROOT_PASS")" ]]; then
+    warn "Tu contraseña empieza o termina con espacios. Se acepta tal cual,"
+    warn "pero recuérdalo al escribirla: no se ven."
+  fi
 unset DB_ROOT_PASS2
 ok "Contraseña de MariaDB aceptada (${#DB_ROOT_PASS} caracteres)."
 
@@ -2516,6 +2598,7 @@ ok "Zona horaria: ${TIMEZONE}"
 # --- 8) Contraseña del Administrator de Frappe [F4] -------------------------
 pantalla "Parámetros del despliegue  ·  8 de 10"
 say "\n${BOLD}8/10${NC} Contraseña del usuario 'Administrator' de Frappe (mín. 12)\n"
+say "      Se admite cualquier símbolo, incluidas comillas y espacios.\n"
 while :; do
   say "     Contraseña: "; read -rs ADMIN_PASS; say "\n"
   say "     Confirmar : "; read -rs ADMIN_PASS2; say "\n"
@@ -2525,12 +2608,15 @@ while :; do
   if (( ${#ADMIN_PASS} < 12 )); then
     fail "Mínimo 12 caracteres (tienes ${#ADMIN_PASS})."; continue
   fi
-  # Va como argumento de 'bench new-site --admin-password'.
-  case "$ADMIN_PASS" in
-    *\'*|*\"*|*\\*|*\`*|*\$*) fail "Sin comillas, backslash, backtick ni \$."; continue ;;
-  esac
+  # [v16.0.6] Cualquier carácter vale: viaja en el array NS_ARGS, que se
+  # expande como "${NS_ARGS[@]}" y llega a bench como un argumento exacto,
+  # sin pasar por ningún shell intermedio ni por eval.
   break
 done
+  if [[ "$ADMIN_PASS" != "$(trim "$ADMIN_PASS")" ]]; then
+    warn "Tu contraseña empieza o termina con espacios. Se acepta tal cual,"
+    warn "pero recuérdalo al escribirla: no se ven."
+  fi
 unset ADMIN_PASS2
 ok "Contraseña de Administrator aceptada (${#ADMIN_PASS} caracteres)."
 
@@ -3425,7 +3511,12 @@ else
 
   info "Aplicando hardening SQL (equivalente a mysql_secure_installation)..."
   SQL_TMP="$(mktemp)"; chmod 600 "$SQL_TMP"
+  # [v16.0.6] La contraseña entra como literal SQL ya escapado. Y se fija el
+  # sql_mode de la sesión: con NO_BACKSLASH_ESCAPES activo, el escape \' no
+  # significaría nada y la sentencia se partiría igual que antes.
+  DB_ROOT_PASS_SQL="$(sql_quote "$DB_ROOT_PASS")"
   cat > "$SQL_TMP" <<SQLEOF
+SET SESSION sql_mode = REPLACE(@@SESSION.sql_mode, 'NO_BACKSLASH_ESCAPES', '');
 USE mysql;
 -- (CIS 4.x) Sin usuarios anónimos
 DELETE FROM global_priv WHERE User='';
@@ -3437,16 +3528,16 @@ DELETE FROM db WHERE Db='test' OR Db='test\\_%';
 -- PASO CRÍTICO: unix_socket -> mysql_native_password.
 -- Frappe corre como '${NEW_USER}', no como root del SO. Sin esto MariaDB
 -- rechaza la conexión aunque la contraseña sea correcta.
-ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD('${DB_ROOT_PASS}');
+ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD(${DB_ROOT_PASS_SQL});
 
 -- [F2] Frappe/bench se conectan por TCP a 127.0.0.1: declaramos las cuentas
 -- literales para que la autenticación funcione con o sin resolución de nombres.
-CREATE USER IF NOT EXISTS 'root'@'127.0.0.1' IDENTIFIED VIA mysql_native_password USING PASSWORD('${DB_ROOT_PASS}');
-ALTER USER 'root'@'127.0.0.1' IDENTIFIED VIA mysql_native_password USING PASSWORD('${DB_ROOT_PASS}');
+CREATE USER IF NOT EXISTS 'root'@'127.0.0.1' IDENTIFIED VIA mysql_native_password USING PASSWORD(${DB_ROOT_PASS_SQL});
+ALTER USER 'root'@'127.0.0.1' IDENTIFIED VIA mysql_native_password USING PASSWORD(${DB_ROOT_PASS_SQL});
 GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;
 
-CREATE USER IF NOT EXISTS 'root'@'::1' IDENTIFIED VIA mysql_native_password USING PASSWORD('${DB_ROOT_PASS}');
-ALTER USER 'root'@'::1' IDENTIFIED VIA mysql_native_password USING PASSWORD('${DB_ROOT_PASS}');
+CREATE USER IF NOT EXISTS 'root'@'::1' IDENTIFIED VIA mysql_native_password USING PASSWORD(${DB_ROOT_PASS_SQL});
+ALTER USER 'root'@'::1' IDENTIFIED VIA mysql_native_password USING PASSWORD(${DB_ROOT_PASS_SQL});
 GRANT ALL PRIVILEGES ON *.* TO 'root'@'::1' WITH GRANT OPTION;
 
 FLUSH PRIVILEGES;
@@ -3611,22 +3702,26 @@ ENV_FILE="${USER_HOME}/.bashcore.env"
 USER_SCRIPT="${USER_HOME}/bashcore-user-phase.sh"
 
 umask 077
+# [v16.0.6] Cada valor pasa por sh_quote. Antes se escribía VAR='${VAR}' a
+# pelo: una comilla simple en la contraseña partía la asignación y el
+# 'source' de la fase de usuario ejecutaba el resto de la línea como código.
+# Ése era el motivo real de prohibir comillas, no un capricho.
 cat > "$ENV_FILE" <<ENVEOF
-NEW_USER='${NEW_USER}'
-DB_ROOT_PASS='${DB_ROOT_PASS}'
-ADMIN_PASS='${ADMIN_PASS}'
-SITE_NAME='${SITE_NAME}'
-NVM_VERSION='${NVM_VERSION}'
-NODE_VERSION='${NODE_VERSION}'
-PYTHON_VERSION='${PYTHON_VERSION}'
-FRAPPE_BRANCH='${FRAPPE_BRANCH}'
-APPS_SEL='${APPS_SEL}'
-WIKI_BRANCH='${WIKI_BRANCH}'
-APPS_DISPONIBLES='${APPS_DISPONIBLES}'
-IS_CT='${IS_CT}'
-NODE_OPTS='${NODE_OPTS}'
-LANG='${LANG}'
-PROGRESS_FILE='${PROGRESS_FILE}'
+NEW_USER=$(sh_quote "${NEW_USER}")
+DB_ROOT_PASS=$(sh_quote "${DB_ROOT_PASS}")
+ADMIN_PASS=$(sh_quote "${ADMIN_PASS}")
+SITE_NAME=$(sh_quote "${SITE_NAME}")
+NVM_VERSION=$(sh_quote "${NVM_VERSION}")
+NODE_VERSION=$(sh_quote "${NODE_VERSION}")
+PYTHON_VERSION=$(sh_quote "${PYTHON_VERSION}")
+FRAPPE_BRANCH=$(sh_quote "${FRAPPE_BRANCH}")
+APPS_SEL=$(sh_quote "${APPS_SEL}")
+WIKI_BRANCH=$(sh_quote "${WIKI_BRANCH}")
+APPS_DISPONIBLES=$(sh_quote "${APPS_DISPONIBLES}")
+IS_CT=$(sh_quote "${IS_CT}")
+NODE_OPTS=$(sh_quote "${NODE_OPTS}")
+LANG=$(sh_quote "${LANG}")
+PROGRESS_FILE=$(sh_quote "${PROGRESS_FILE}")
 ENVEOF
 chown "${NEW_USER}:${NEW_USER}" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
