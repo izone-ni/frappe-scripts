@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v16.0.7
+#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v16.0.9
 #  https://github.com/izone-ni/frappe-scripts
-#  Despliegue automatizado + hardening de Frappe 16 / ERPNext 16
+#  Despliegue automatizado + hardening de Frappe 15 y 16 / ERPNext
 #  Base: Ubuntu 24.04 LTS   Refs: CIS Ubuntu 24.04 v1.0.0, CIS NGINX v3.0.0
 #
 #  USO:
@@ -15,6 +15,33 @@
 #  El script detecta el entorno y se adapta. En un CT hay operaciones que el
 #  kernel del host NO delega al contenedor; se detallan en 'AJUSTES EN EL
 #  NODO PROXMOX' al final de esta cabecera.
+#
+#  CAMBIOS v16.0.9 (sólo Frappe 15/16 y varias llaves SSH):
+#   CAUSA: Frappe 13 y 14 ya no tienen soporte y sólo se daban por
+#   compatibles con Ubuntu 18.04-22.04, que este script no valida. Ofrecerlas
+#   era prometer un despliegue que nadie prueba. Y la pregunta 4/10 aceptaba
+#   UNA llave: con el acceso por contraseña desactivado, la llave de un
+#   segundo operador o la de respaldo había que añadirla a mano después.
+#
+#   [K1] Fuera la 13 y la 14 de la matriz FV_*, de los bucles de versiones y
+#        del banner. El menú de versiones se sigue construyendo desde la matriz.
+#   [K2] La pregunta 4/10 acepta hasta MAX_LLAVES_SSH (8) llaves, con la misma
+#        validación: regex y 'ssh-keygen -l', que es quien decide. Tras cada
+#        una muestra la huella y pregunta si añadir otra. Los duplicados
+#        exactos se descartan con aviso. Al menos una es obligatoria.
+#   [K3] SSH_PUBKEY pasa a ser el array SSH_PUBKEYS. 'fase1_llaves' escribe
+#        todas, una por línea, sin duplicar las que ya estuvieran.
+#   [K4] Con 'fase1_llaves' ya completado, las llaves de esta ejecución se
+#        añaden igual. Antes el checkpoint habría dejado fuera una llave nueva
+#        escrita en una reanudación.
+#   [K5] El resumen muestra cuántas llaves hay y la huella de cada una.
+#   [K6] Redacción de menús y preguntas: verbo primero, una idea por línea y
+#        errores que dicen qué pasó y qué hacer.
+#
+#   VIGILAR: un servidor con Frappe 13/14 ya instalado sigue pudiendo usar
+#   '--reparar' y el diagnóstico (no dependen de la versión), pero el
+#   instalador ya no puede reanudarlo. Y si se añade una versión nueva, la
+#   lista '16 15' sigue escrita a mano en validar_so y menu_version.
 #
 #  CAMBIOS v16.0.7 (Socket.io en BACKOFF: "node not found"):
 #   SÍNTOMA: el sitio responde 200 y seis de los siete procesos están RUNNING,
@@ -80,6 +107,7 @@
 #        que al instalar la 13 ofrecía HRMS y Lending —que no tienen rama en esa
 #        versión— y el fallo aparecía 40 minutos después, en 'bench get-app'.
 #        El menú se construye ahora desde FV_APPS de la rama elegida.
+#        (Desde v16.0.9 sólo quedan la 15 y la 16, con las mismas cuatro apps.)
 #   [U3] Una pregunta por pantalla. Antes se acumulaban los dos menús, la matriz
 #        de compatibilidad y las diez preguntas, y al llegar al resumen no se
 #        veía nada de lo contestado.
@@ -378,30 +406,25 @@ TIMEZONE="America/Managua"   # valor por defecto; la pregunta 6/10 lo cambia
 # la línea de inicio del log. Antes había tres valores distintos conviviendo
 # (v2.x en la cabecera, v1.0.0 en el banner) y era imposible saber, mirando
 # una captura de pantalla, qué versión había corrido de verdad.
-VERSION_SCRIPT="v16.0.7"
+VERSION_SCRIPT="v16.0.9"
 # ---------------------------------------------------------------------------
 #  MATRIZ DE COMPATIBILIDAD (verificada contra los repositorios de Frappe)
 #    campos: rama | python | node | mariadb | apps | SO compatibles
 #  Las versiones de Python y Node NO son preferencia: salen de lo que cada
 #  rama declara en su pyproject.toml y su package.json.
 # ---------------------------------------------------------------------------
-declare -A FV_RAMA=(   [16]="version-16" [15]="version-15" [14]="version-14" [13]="version-13" )
-declare -A FV_PYTHON=( [16]="3.14"      [15]="3.11"       [14]="3.10"       [13]="3.9" )
-declare -A FV_NODE=(   [16]="24"        [15]="20"         [14]="16"         [13]="14" )
-declare -A FV_DB=(     [16]="mariadb-11.8.8" [15]="mariadb-11.8.8" [14]="mariadb-10.6" [13]="mariadb-10.6" )
-declare -A FV_APPS=(   [16]="erpnext hrms lending wiki" [15]="erpnext hrms lending wiki"
-                       [14]="erpnext hrms wiki"         [13]="erpnext wiki" )
-# 'wiki' sólo tiene rama propia en la 13 y la 14; en la 15/16 va por master.
-declare -A FV_WIKI=(   [16]="master" [15]="master" [14]="version-14" [13]="version-13" )
+declare -A FV_RAMA=(   [16]="version-16" [15]="version-15" )
+declare -A FV_PYTHON=( [16]="3.14"      [15]="3.11" )
+declare -A FV_NODE=(   [16]="24"        [15]="20" )
+declare -A FV_DB=(     [16]="mariadb-11.8.8" [15]="mariadb-11.8.8" )
+declare -A FV_APPS=(   [16]="erpnext hrms lending wiki" [15]="erpnext hrms lending wiki" )
+# 'wiki' no tiene rama version-15/16: en las dos va por master.
+declare -A FV_WIKI=(   [16]="master" [15]="master" )
 # Sistemas probados y sistemas tolerados (con aviso).
 declare -A FV_SO_OK=(  [16]="ubuntu-24.04"
-                       [15]="ubuntu-22.04 ubuntu-24.04"
-                       [14]="ubuntu-20.04 ubuntu-22.04"
-                       [13]="ubuntu-20.04 ubuntu-22.04" )
+                       [15]="ubuntu-22.04 ubuntu-24.04" )
 declare -A FV_SO_AVISO=( [16]="ubuntu-26.04 debian-13"
-                         [15]="ubuntu-26.04 debian-12 debian-13"
-                         [14]="ubuntu-24.04 debian-12"
-                         [13]="ubuntu-18.04" )
+                         [15]="ubuntu-26.04 debian-12 debian-13" )
 
 MARIADB_VERSION="mariadb-11.8.8"
 NVM_VERSION="v0.39.7"
@@ -410,6 +433,8 @@ PYTHON_VERSION="3.14"
 FRAPPE_BRANCH="version-16"
 WKHTML_VERSION="0.12.6.1-2"
 MIN_RAM_MB=3800
+# Tope de la pregunta 4/10: evita que un pegado accidental entre en bucle.
+MAX_LLAVES_SSH=8
 SWAP_SIZE="4G"
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'
@@ -786,8 +811,8 @@ pressure_report() {
 # [P4] Catálogo de pasos. El orden es el de ejecución y los identificadores
 # deben coincidir con los que emite la fase de usuario.
 # Los pasos se construyen según las aplicaciones que existan para la versión
-# elegida: la 13 tiene dos apps y la 16 cuatro, así que ni el número de pasos
-# ni los pesos pueden estar escritos a mano.
+# elegida (FV_APPS), así que ni el número de pasos ni los pesos pueden estar
+# escritos a mano.
 PASOS_ID=(); PASOS_LABEL=(); PASOS_PESO=(); PASOS_SEGS=()
 
 construir_pasos() {
@@ -1447,18 +1472,18 @@ detectar_instalacion() {
 # Submenú: se elige qué comprobar en lugar de volcarlo todo de golpe.
 menu_diagnostico() {
   while :; do
-    say "\n  ${BOLD}¿Qué quieres diagnosticar?${NC}\n\n"
+    say "\n  ${BOLD}¿Qué quieres revisar?${NC}\n\n"
     # El diagnóstico NO limpia: su valor está en poder comparar bloques.
-    say "    ${BOLD}1${NC}) Todo (informe completo)\n"
-    say "    ${BOLD}2${NC}) Servicios del sistema (MariaDB, Redis, Nginx, Supervisor, SSH)\n"
-    say "    ${BOLD}3${NC}) Puertos a la escucha\n"
-    say "    ${BOLD}4${NC}) Instalación de Frappe (bench, sitio y aplicaciones)\n"
-    say "    ${BOLD}5${NC}) Respuesta del sitio por HTTP\n"
-    say "    ${BOLD}6${NC}) Procesos de Supervisor\n"
-    say "    ${BOLD}7${NC}) Errores recientes en los registros\n"
-    say "    ${BOLD}8${NC}) Recursos: memoria, disco e inodos\n"
+    say "    ${BOLD}1${NC}) Revisar todo (informe completo)\n"
+    say "    ${BOLD}2${NC}) Revisar servicios (MariaDB, Redis, Nginx, Supervisor, SSH)\n"
+    say "    ${BOLD}3${NC}) Ver puertos a la escucha\n"
+    say "    ${BOLD}4${NC}) Revisar Frappe (bench, sitio y aplicaciones)\n"
+    say "    ${BOLD}5${NC}) Probar la respuesta HTTP del sitio\n"
+    say "    ${BOLD}6${NC}) Ver procesos de Supervisor\n"
+    say "    ${BOLD}7${NC}) Ver errores recientes en los registros\n"
+    say "    ${BOLD}8${NC}) Ver recursos: memoria, disco e inodos\n"
     say "    ${BOLD}9${NC}) Generar paquete de diagnóstico (.tar.gz)\n"
-    say "    ${BOLD}R${NC}) REPARAR el arranque ahora (habilita servicios y ordena el boot)\n"
+    say "    ${BOLD}R${NC}) Reparar el arranque: que el sitio vuelva solo tras reiniciar\n"
     say "    ${BOLD}0${NC}) Volver al menú principal\n\n  > "
     local op; read -r op || op=0
     case "$(trim "${op}")" in
@@ -1473,7 +1498,7 @@ menu_diagnostico() {
       9) generar_diag ;;
       R|r|reparar|10) reparar_arranque ;;
       0) return 0 ;;
-      *) say "  ${RED}Opción no válida.${NC}\n" ;;
+      *) say "  ${RED}Opción no válida. Elige una de la lista.${NC}\n" ;;
     esac
   done
 }
@@ -1790,15 +1815,15 @@ validar_so() {
   say "  disponibles en los repositorios, así que 'bench init' fallaría al\n"
   say "  construir el entorno virtual, o los assets no compilarían.\n\n"
   say "  Sistemas soportados por Frappe ${v}: ${BOLD}${FV_SO_OK[$v]} ${FV_SO_AVISO[$v]:-}${NC}\n\n"
-  for otra in 16 15 14 13; do
+  for otra in 16 15; do
     [[ "$otra" == "$v" ]] && continue
     so_compatible "$otra" && alternativas+="${otra} "
   done
   if [[ -n "$alternativas" ]]; then
     say "  En ${so} sí puedes instalar: ${GREEN}${BOLD}Frappe ${alternativas% }${NC}\n\n"
   fi
-  say "  Pulsa ${BOLD}Enter${NC} para elegir otra versión, o escribe ${BOLD}SEGUIR${NC} para\n"
-  say "  instalar de todas formas bajo tu responsabilidad: "
+  say "  ${BOLD}Enter${NC} elige otra versión. ${BOLD}SEGUIR${NC} instala igualmente,\n"
+  say "  bajo tu responsabilidad: "
   read -r _r || _r=""
   if [[ "$(trim "${_r^^}")" == "SEGUIR" ]]; then
     warn "Instalación FORZADA de Frappe ${v} sobre ${so} a petición del operador."
@@ -1810,7 +1835,7 @@ validar_so() {
 menu_version() {
   local so v i op; so="$(so_actual)"
   local -a compatibles=()
-  for v in 16 15 14 13; do
+  for v in 16 15; do
     so_compatible "$v" && compatibles+=("$v")
   done
 
@@ -1819,11 +1844,11 @@ menu_version() {
   if (( ${#compatibles[@]} == 0 )); then
     pantalla "Sistema no soportado"
     say "  ${RED}${BOLD}Ninguna versión de Frappe es compatible con ${so}.${NC}\n\n"
-    say "  Este script soporta:\n"
-    for v in 16 15 14 13; do
+    say "  Sistemas soportados:\n"
+    for v in 16 15; do
       say "    Frappe ${v}  ·  ${FV_SO_OK[$v]} ${FV_SO_AVISO[$v]:-}\n"
     done
-    say "\n  Instala sobre uno de esos sistemas. Pulsa ${BOLD}Enter${NC} para volver: "
+    say "\n  Usa uno de esos sistemas. ${BOLD}Enter${NC} para volver: "
     read -r _ || true
     return 1
   fi
@@ -1834,7 +1859,7 @@ menu_version() {
   local -a listadas=()
   local todas=0
   while :; do
-    if (( todas )); then listadas=(16 15 14 13); else listadas=("${compatibles[@]}"); fi
+    if (( todas )); then listadas=(16 15); else listadas=("${compatibles[@]}"); fi
     pantalla "Versión de Frappe a instalar"
     i=1
     for v in "${listadas[@]}"; do
@@ -1845,9 +1870,9 @@ menu_version() {
     done
     say "    ${BOLD}0${NC}) Volver\n\n"
     if (( todas )); then
-      say "  Mostrando ${BOLD}todas${NC} las ramas. Las marcadas en rojo pedirán confirmación.\n\n  > "
+      say "  Todas las ramas. Las marcadas en rojo piden confirmación.\n\n  > "
     else
-      say "  Sólo versiones compatibles con ${BOLD}${so}${NC}. Escribe ${BOLD}T${NC} para ver todas.\n\n  > "
+      say "  Compatibles con ${BOLD}${so}${NC}. ${BOLD}T${NC} muestra todas.\n\n  > "
     fi
     read -r op || op=0
     op="$(trim "${op}")"
@@ -1859,7 +1884,7 @@ menu_version() {
       aplicar_version "${listadas[$((op-1))]}"
       if validar_so "$FRAPPE_VER"; then return 0; fi
     else
-      say "  ${RED}Opción no válida.${NC}\n"; sleep 1
+      say "  ${RED}Opción no válida. Elige un número de la lista.${NC}\n"; sleep 1
     fi
   done
 }
@@ -2330,9 +2355,9 @@ menu_principal() {
   while :; do
     pantalla "¿Qué quieres hacer?"
     say "    ${BOLD}1${NC}) Instalar      · despliegue limpio con hardening CIS\n"
-    say "    ${BOLD}2${NC}) Diagnóstico   · estado de servicios, sitio y errores\n"
-    say "    ${BOLD}3${NC}) Reparar       · el sitio no vuelve tras reiniciar (no reinstala)\n"
-    say "    ${BOLD}4${NC}) Desinstalar   · eliminar todo y dejar el sistema como estaba\n"
+    say "    ${BOLD}2${NC}) Diagnosticar  · revisar servicios, sitio y errores\n"
+    say "    ${BOLD}3${NC}) Reparar       · que el sitio vuelva tras reiniciar (no reinstala)\n"
+    say "    ${BOLD}4${NC}) Desinstalar   · borrar todo y dejar el sistema como estaba\n"
     say "    ${BOLD}5${NC}) Salir\n\n  > "
     local op; read -r op || op=5
     case "$(trim "${op}")" in
@@ -2341,7 +2366,7 @@ menu_principal() {
       3) reparar_arranque ;;          # vuelve al menú al terminar
       4) desinstalar ;;               # vuelve al menú al terminar
       5) say "\n  Hasta luego.\n\n"; exit 0 ;;
-      *) say "  ${RED}Opción no válida.${NC}\n" ;;
+      *) say "  ${RED}Opción no válida. Elige una de la lista.${NC}\n" ;;
     esac
   done
 }
@@ -2378,7 +2403,7 @@ touch "$LOG_FILE"; chmod 600 "$LOG_FILE"
 exec >> "$LOG_FILE" 2>&1
 
 banner_izone
-say "        Frappe 16 · 15 · 14 · 13   ·   ERPNext · HRMS · Lending · Wiki\n"
+say "        Frappe 16 · 15   ·   ERPNext · HRMS · Lending · Wiki\n"
 say "        $(so_actual) · CIS Hardening · ${VERSION_SCRIPT}\n\n"
 echo -e "\n### iZone bashcore-frappe ${VERSION_SCRIPT} | Inicio: $(date -Is) | PID $$ ###"
 [[ -n "$BC_PREFIX" ]] && warn "MODO PRUEBAS: todas las rutas bajo ${BC_PREFIX}"
@@ -2510,8 +2535,8 @@ phase "PARÁMETROS DE DESPLIEGUE (10 preguntas)"
 
 # --- 1) Nombre de la empresa -------------------------------------------------
 pantalla "Parámetros del despliegue  ·  1 de 10"
-say "${YELLOW}Tras responder estas 10 preguntas el script es 100% desatendido.${NC}\n\n"
-say "${BOLD}1/10${NC} Nombre de la empresa (aparecerá en el encabezado): "
+say "${YELLOW}Tras estas 10 preguntas, el resto es desatendido.${NC}\n\n"
+say "${BOLD}1/10${NC} Nombre de la empresa (sale en el encabezado): "
 while :; do
   read -r EMPRESA
   EMPRESA="$(trim "$EMPRESA")"
@@ -2519,10 +2544,10 @@ while :; do
     fail "Escribe al menos 2 caracteres."; say "     > "; continue
   fi
   if (( ${#EMPRESA} > 24 )); then
-    fail "Máximo 24 caracteres (para que quepa en el encabezado)."; say "     > "; continue
+    fail "Demasiado largo: máximo 24 caracteres."; say "     > "; continue
   fi
   case "$EMPRESA" in
-    *[\\\'\"\`\$]*) fail "Sin comillas, backslash, backtick ni \$."; say "     > "; continue ;;
+    *[\\\'\"\`\$]*) fail "No admite comillas, backslash, backtick ni \$. Quítalos."; say "     > "; continue ;;
   esac
   break
 done
@@ -2549,23 +2574,23 @@ pantalla "Parámetros del despliegue  ·  2 de 10"
 [[ -n "$SUGERENCIA" ]] && say "  Usuarios con sudo detectados: ${BOLD}${SUDO_USERS}${NC}\n\n"
 while :; do
   if [[ -n "$SUGERENCIA" ]]; then
-  say "${BOLD}2/10${NC} Usuario operativo (se crea si no existe; ej: sysadmin) [${BOLD}${SUGERENCIA}${NC}]: "
+  say "${BOLD}2/10${NC} Usuario operativo (ej: sysadmin; se crea si no existe) [${BOLD}${SUGERENCIA}${NC}]: "
 else
-  say "${BOLD}2/10${NC} Usuario operativo (se crea si no existe; ej: sysadmin): "
+  say "${BOLD}2/10${NC} Usuario operativo (ej: sysadmin; se crea si no existe): "
 fi
   read -r NEW_USER
   NEW_USER="$(trim "$NEW_USER")"
   # Enter en blanco acepta el usuario administrativo ya existente.
   [[ -z "$NEW_USER" && -n "$SUGERENCIA" ]] && NEW_USER="$SUGERENCIA"
   if [[ ! "$NEW_USER" =~ ^[a-z_][a-z0-9_-]{2,31}$ ]]; then
-    fail "Inválido: minúsculas, números, '-' y '_' (3-32 caracteres)."; continue
+    fail "Nombre no válido. Usa 3-32 minúsculas, números, '-' o '_'."; continue
   fi
   case "$NEW_USER" in
     root|daemon|bin|sys|www-data|mysql|nobody|systemd-*|redis|nginx)
-      fail "'${NEW_USER}' es un usuario reservado del sistema."; continue ;;
+      fail "'${NEW_USER}' es un usuario reservado del sistema. Elige otro."; continue ;;
   esac
   if id "$NEW_USER" &>/dev/null; then
-    warn "El usuario '${NEW_USER}' ya existe: se reutilizará, no se recreará."
+    warn "'${NEW_USER}' ya existe: se reutiliza, no se recrea."
   fi
   break
 done
@@ -2575,17 +2600,17 @@ done
 # SSH seguirá siendo SÓLO por llave (PasswordAuthentication no).
 pantalla "Parámetros del despliegue  ·  3 de 10"
 if id "$NEW_USER" &>/dev/null; then
-  say "\n${BOLD}3/10${NC} '${NEW_USER}' YA EXISTE. Escribe SU contraseña actual (o la nueva\n"
-  say "      que quieras dejarle: se aplicará al usuario existente)\n"
+  say "\n${BOLD}3/10${NC} Contraseña de '${NEW_USER}', que ya existe (mín. 12 caracteres)\n"
+  say "      Se le aplica la que escribas: la actual o una nueva.\n"
 else
-  say "\n${BOLD}3/10${NC} Contraseña para el usuario NUEVO '${NEW_USER}' (mín. 12 caracteres)\n"
-  say "      Se admite cualquier símbolo, incluidas comillas y espacios.\n"
+  say "\n${BOLD}3/10${NC} Contraseña del usuario nuevo '${NEW_USER}' (mín. 12 caracteres)\n"
+  say "      Admite cualquier carácter, también comillas y espacios.\n"
 fi
 while :; do
   say "     Contraseña: "; read -rs OS_USER_PASS; say "\n"
   say "     Confirmar : "; read -rs OS_USER_PASS2; say "\n"
   if [[ "$OS_USER_PASS" != "$OS_USER_PASS2" ]]; then
-    fail "No coinciden."; continue
+    fail "No coinciden. Escríbela otra vez."; continue
   fi
   if (( ${#OS_USER_PASS} < 12 )); then
     fail "Mínimo 12 caracteres (tienes ${#OS_USER_PASS})."; continue
@@ -2597,51 +2622,88 @@ while :; do
   break
 done
   if [[ "$OS_USER_PASS" != "$(trim "$OS_USER_PASS")" ]]; then
-    warn "Tu contraseña empieza o termina con espacios. Se acepta tal cual,"
-    warn "pero recuérdalo al escribirla: no se ven."
+    warn "La contraseña empieza o termina con espacios: se acepta así."
+    warn "Recuérdalo al escribirla: no se ven."
   fi
 unset OS_USER_PASS2
 ok "Contraseña del usuario aceptada (${#OS_USER_PASS} caracteres)."
 
-# --- 4) Llave pública SSH ----------------------------------------------------
+# --- 4) Llaves públicas SSH ------------------------------------------------
+# Al menos una es obligatoria: el acceso por contraseña queda desactivado y
+# sin llave el operador se queda fuera del servidor.
 pantalla "Parámetros del despliegue  ·  4 de 10"
 say "\n${BOLD}4/10${NC} Llave pública SSH para '${NEW_USER}' (una sola línea)\n"
+say "      Podrás añadir más después de cada una (máx. ${MAX_LLAVES_SSH}).\n"
+SSH_PUBKEYS=(); SSH_HUELLAS=()
 while :; do
   say "     > "
-  read -r SSH_PUBKEY
-  SSH_PUBKEY="$(trim "$SSH_PUBKEY")"
-  if [[ "$SSH_PUBKEY" =~ ^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-nistp[0-9]+|sk-(ssh-ed25519|ecdsa-sha2-nistp256))@?[a-z0-9.-]*[[:space:]]+[A-Za-z0-9+/=]{20,}([[:space:]].*)?$ ]]; then
-    # Validación real con ssh-keygen (mejor que una regex).
-    # OJO: se usa un archivo temporal, NO 'printf | ssh-keygen'. Con pipefail,
-    # si el lector cierra la tubería antes de leer, printf recibe SIGPIPE y
-    # una llave perfectamente válida sería rechazada. Es la misma familia de
-    # error que el 'tr | head' que rompió la v1.
-    if command -v ssh-keygen >/dev/null 2>&1; then
-      KEY_TMP="$(mktemp)"
-      printf '%s\n' "$SSH_PUBKEY" > "$KEY_TMP"
-      if KEY_FP="$(ssh-keygen -l -f "$KEY_TMP" 2>/dev/null)"; then
-        rm -f "$KEY_TMP"
-        ok "Llave válida: ${KEY_FP}"
-        break
-      else
-        rm -f "$KEY_TMP"
-        fail "ssh-keygen rechaza la llave (¿está truncada o mal pegada?)."; continue
-      fi
+  read -r _llave
+  _llave="$(trim "$_llave")"
+  if [[ -z "$_llave" ]]; then
+    (( ${#SSH_PUBKEYS[@]} > 0 )) && break
+    fail "Hace falta al menos una llave: sin ella te quedas fuera del servidor."; continue
+  fi
+  if [[ ! "$_llave" =~ ^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-nistp[0-9]+|sk-(ssh-ed25519|ecdsa-sha2-nistp256))@?[a-z0-9.-]*[[:space:]]+[A-Za-z0-9+/=]{20,}([[:space:]].*)?$ ]]; then
+    fail "No es una llave pública. Debe empezar por ssh-ed25519, ssh-rsa o ecdsa-sha2-..."
+    fail "No pegues la llave PRIVADA ni un archivo .pem."
+    continue
+  fi
+  # Validación real con ssh-keygen (mejor que una regex).
+  # OJO: se usa un archivo temporal, NO 'printf | ssh-keygen'. Con pipefail,
+  # si el lector cierra la tubería antes de leer, printf recibe SIGPIPE y
+  # una llave perfectamente válida sería rechazada. Es la misma familia de
+  # error que el 'tr | head' que rompió la v1.
+  KEY_FP=""
+  if command -v ssh-keygen >/dev/null 2>&1; then
+    KEY_TMP="$(mktemp)"
+    printf '%s\n' "$_llave" > "$KEY_TMP"
+    if KEY_FP="$(ssh-keygen -l -f "$KEY_TMP" 2>/dev/null)"; then
+      rm -f "$KEY_TMP"
+    else
+      rm -f "$KEY_TMP"
+      fail "ssh-keygen rechaza la llave: está truncada o mal pegada. Pégala de nuevo."; continue
     fi
+  fi
+  _dup=0
+  for _k in "${SSH_PUBKEYS[@]}"; do
+    if [[ "$_k" == "$_llave" ]]; then _dup=1; break; fi
+  done
+  if (( _dup )); then
+    warn "Esa llave ya está en la lista."
+  else
+    SSH_PUBKEYS+=("$_llave")
+    # "256 SHA256:xxxx comentario (ED25519)" -> "ED25519 SHA256:xxxx"
+    if [[ -n "$KEY_FP" ]]; then
+      _tipo="${KEY_FP##*(}"; _tipo="${_tipo%)}"
+      _huella="${KEY_FP#* }"; _huella="${_huella%% *}"
+      SSH_HUELLAS+=("${_tipo} ${_huella}")
+      ok "Llave ${#SSH_PUBKEYS[@]} válida: ${KEY_FP}"
+    else
+      SSH_HUELLAS+=("sin verificar (falta ssh-keygen)")
+      warn "Llave ${#SSH_PUBKEYS[@]} aceptada sin verificar: no hay ssh-keygen."
+    fi
+  fi
+  if (( ${#SSH_PUBKEYS[@]} >= MAX_LLAVES_SSH )); then
+    info "Tope de ${MAX_LLAVES_SSH} llaves alcanzado."
     break
   fi
-  fail "No parece una llave pública. Debe iniciar con ssh-ed25519, ssh-rsa, ecdsa-sha2-..."
-  fail "Ojo: NO pegues la llave PRIVADA ni el contenido de un archivo .pem."
+  say "     ¿Añadir otra llave? [s/N]: "
+  read -r _r || _r=""
+  case "$(trim "${_r,,}")" in
+    s|si|sí) continue ;;
+    *) break ;;
+  esac
 done
+unset _llave _k _dup _tipo _huella _r
 
 # --- 5) Puerto SSH -----------------------------------------------------------
 pantalla "Parámetros del despliegue  ·  5 de 10"
 while :; do
-  say "\n${BOLD}5/10${NC} Puerto SSH personalizado (ej: 2222): "
+  say "\n${BOLD}5/10${NC} Puerto SSH nuevo (ej: 2222; el 22 se cerrará): "
   read -r SSH_PORT
   SSH_PORT="$(trim "$SSH_PORT")"
   if [[ ! "$SSH_PORT" =~ ^[0-9]+$ ]] || (( SSH_PORT < 1024 || SSH_PORT > 65535 )); then
-    fail "Debe ser un número entre 1024 y 65535."; continue
+    fail "Puerto no válido. Usa un número entre 1024 y 65535."; continue
   fi
   # Puertos que Frappe, MariaDB y Nginx ya usan.
   case "$SSH_PORT" in
@@ -2652,9 +2714,9 @@ while :; do
   # reanudación: rechazarlo dejaría el script en un bucle infinito.
   if ss -H -tln 2>/dev/null | grep -q ":${SSH_PORT}[[:space:]]"; then
     if grep -qs "^Port ${SSH_PORT}$" "${ETC}/ssh/sshd_config.d/99-custom.conf"; then
-      info "El puerto ${SSH_PORT} ya lo sirve el sshd que configuró este script (reanudación)."
+      info "El puerto ${SSH_PORT} ya es el sshd de este script (reanudación)."
     else
-      fail "El puerto ${SSH_PORT} ya está ocupado por otro servicio."; continue
+      fail "El puerto ${SSH_PORT} lo ocupa otro servicio. Elige otro."; continue
     fi
   fi
   break
@@ -2662,13 +2724,13 @@ done
 
 # --- 6) Password de root de MariaDB ------------------------------------------
 pantalla "Parámetros del despliegue  ·  6 de 10"
-say "\n${BOLD}6/10${NC} Contraseña para 'root' de MariaDB (mín. 12 caracteres)\n"
-say "      Se admite cualquier símbolo, incluidas comillas y espacios.\n"
+say "\n${BOLD}6/10${NC} Contraseña de 'root' en MariaDB (mín. 12 caracteres)\n"
+say "      Admite cualquier carácter, también comillas y espacios.\n"
 while :; do
   say "     Contraseña: "; read -rs DB_ROOT_PASS; say "\n"
   say "     Confirmar : "; read -rs DB_ROOT_PASS2; say "\n"
   if [[ "$DB_ROOT_PASS" != "$DB_ROOT_PASS2" ]]; then
-    fail "No coinciden."; continue
+    fail "No coinciden. Escríbela otra vez."; continue
   fi
   if (( ${#DB_ROOT_PASS} < 12 )); then
     fail "Mínimo 12 caracteres (tienes ${#DB_ROOT_PASS})."; continue
@@ -2679,8 +2741,8 @@ while :; do
   break
 done
   if [[ "$DB_ROOT_PASS" != "$(trim "$DB_ROOT_PASS")" ]]; then
-    warn "Tu contraseña empieza o termina con espacios. Se acepta tal cual,"
-    warn "pero recuérdalo al escribirla: no se ven."
+    warn "La contraseña empieza o termina con espacios: se acepta así."
+    warn "Recuérdalo al escribirla: no se ven."
   fi
 unset DB_ROOT_PASS2
 ok "Contraseña de MariaDB aceptada (${#DB_ROOT_PASS} caracteres)."
@@ -2697,21 +2759,21 @@ while :; do
   if [[ -f "/usr/share/zoneinfo/${TZ_IN}" ]]; then
     TIMEZONE="$TZ_IN"; break
   fi
-  fail "No existe '/usr/share/zoneinfo/${TZ_IN}'. Ejemplos: America/Managua,"
-  fail "Europe/Madrid, America/Mexico_City, UTC. (Enter = America/Managua)"
+  fail "Zona horaria desconocida: '${TZ_IN}'."
+  fail "Prueba America/Managua, Europe/Madrid o UTC. (Enter = America/Managua)"
   say "     > "
 done
 ok "Zona horaria: ${TIMEZONE}"
 
 # --- 8) Contraseña del Administrator de Frappe [F4] -------------------------
 pantalla "Parámetros del despliegue  ·  8 de 10"
-say "\n${BOLD}8/10${NC} Contraseña del usuario 'Administrator' de Frappe (mín. 12)\n"
-say "      Se admite cualquier símbolo, incluidas comillas y espacios.\n"
+say "\n${BOLD}8/10${NC} Contraseña de 'Administrator' en Frappe (mín. 12 caracteres)\n"
+say "      Admite cualquier carácter, también comillas y espacios.\n"
 while :; do
   say "     Contraseña: "; read -rs ADMIN_PASS; say "\n"
   say "     Confirmar : "; read -rs ADMIN_PASS2; say "\n"
   if [[ "$ADMIN_PASS" != "$ADMIN_PASS2" ]]; then
-    fail "No coinciden."; continue
+    fail "No coinciden. Escríbela otra vez."; continue
   fi
   if (( ${#ADMIN_PASS} < 12 )); then
     fail "Mínimo 12 caracteres (tienes ${#ADMIN_PASS})."; continue
@@ -2722,8 +2784,8 @@ while :; do
   break
 done
   if [[ "$ADMIN_PASS" != "$(trim "$ADMIN_PASS")" ]]; then
-    warn "Tu contraseña empieza o termina con espacios. Se acepta tal cual,"
-    warn "pero recuérdalo al escribirla: no se ven."
+    warn "La contraseña empieza o termina con espacios: se acepta así."
+    warn "Recuérdalo al escribirla: no se ven."
   fi
 unset ADMIN_PASS2
 ok "Contraseña de Administrator aceptada (${#ADMIN_PASS} caracteres)."
@@ -2731,7 +2793,7 @@ ok "Contraseña de Administrator aceptada (${#ADMIN_PASS} caracteres)."
 # --- 9) Nombre del sitio -----------------------------------------------------
 pantalla "Parámetros del despliegue  ·  9 de 10"
 while :; do
-  say "\n${BOLD}9/10${NC} Nombre del sitio Frappe (ej: misitio.com): "
+  say "\n${BOLD}9/10${NC} Nombre del sitio (ej: misitio.com): "
   read -r SITE_NAME
   SITE_NAME="$(trim "$SITE_NAME")"
   SITE_NAME="${SITE_NAME,,}"                    # a minúsculas (Bash 4+)
@@ -2741,7 +2803,7 @@ while :; do
   if [[ "$SITE_NAME" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] && (( ${#SITE_NAME} <= 60 )); then
     break
   fi
-  fail "Inválido: minúsculas, números, puntos y guiones. Sin '_' ni espacios."
+  fail "Nombre no válido. Usa minúsculas, números, puntos y guiones."
 done
 
 # --- 10) Aplicaciones a instalar ---------------------------------------------
@@ -2833,6 +2895,10 @@ tabla_sep
 tabla_fila "Usuario operativo" "${NEW_USER}"
 tabla_fila "Puerto SSH"       "${SSH_PORT}   (el 22 quedará CERRADO)"
 tabla_fila "Autenticación"    "sólo llave pública (password OFF, root OFF)"
+tabla_fila "Llaves SSH"       "${#SSH_PUBKEYS[@]}"
+for _i in "${!SSH_HUELLAS[@]}"; do
+  tabla_fila "  $((_i+1))"          "${SSH_HUELLAS[$_i]}"
+done
 tabla_fila "Zona horaria"     "${TIMEZONE}"
 tabla_sep
 tabla_fila "MariaDB"          "${MARIADB_VERSION}, bind 127.0.0.1"
@@ -3190,15 +3256,32 @@ fi
 # --- 1.2 Migración de llaves SSH (antes de tocar sshd) ----------------------
 if is_done fase1_llaves; then
   skip "Migración de llaves SSH"
+  # Las llaves de la pregunta 4/10 se aplican aunque el paso esté completado:
+  # si en esta ejecución se añadió una, el checkpoint no debe dejarla fuera.
+  AUTH_KEYS="${USER_HOME}/.ssh/authorized_keys"
+  if [[ -f "$AUTH_KEYS" ]]; then
+    _nuevas=0
+    for _k in "${SSH_PUBKEYS[@]}"; do
+      if ! grep -qxF -- "$_k" "$AUTH_KEYS" 2>/dev/null; then
+        printf '%s\n' "$_k" >> "$AUTH_KEYS"; _nuevas=$((_nuevas+1))
+      fi
+    done
+    if (( _nuevas > 0 )); then
+      chown "${NEW_USER}:${NEW_USER}" "$AUTH_KEYS"; chmod 600 "$AUTH_KEYS"
+      ok "authorized_keys: ${_nuevas} llave(s) nueva(s) añadida(s)."
+    fi
+  fi
 else
   info "Instalando authorized_keys de '${NEW_USER}'..."
   install -d -m 700 -o "$NEW_USER" -g "$NEW_USER" "${USER_HOME}/.ssh"
   AUTH_KEYS="${USER_HOME}/.ssh/authorized_keys"
   touch "$AUTH_KEYS"
-  # Idempotente: no duplicamos la llave si ya está.
-  if ! grep -qxF "$SSH_PUBKEY" "$AUTH_KEYS" 2>/dev/null; then
-    printf '%s\n' "$SSH_PUBKEY" >> "$AUTH_KEYS"
-  fi
+  # Idempotente: no duplicamos las llaves que ya estén.
+  for _k in "${SSH_PUBKEYS[@]}"; do
+    if ! grep -qxF -- "$_k" "$AUTH_KEYS" 2>/dev/null; then
+      printf '%s\n' "$_k" >> "$AUTH_KEYS"
+    fi
+  done
   # Heredamos las llaves de root como red de seguridad.
   if [[ -s "${ROOTDIR}/.ssh/authorized_keys" ]]; then
     cat "${ROOTDIR}/.ssh/authorized_keys" >> "$AUTH_KEYS"
