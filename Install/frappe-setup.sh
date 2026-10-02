@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v16.0.6
+#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v16.0.7
 #  https://github.com/izone-ni/frappe-scripts
 #  Despliegue automatizado + hardening de Frappe 16 / ERPNext 16
 #  Base: Ubuntu 24.04 LTS   Refs: CIS Ubuntu 24.04 v1.0.0, CIS NGINX v3.0.0
@@ -15,6 +15,34 @@
 #  El script detecta el entorno y se adapta. En un CT hay operaciones que el
 #  kernel del host NO delega al contenedor; se detallan en 'AJUSTES EN EL
 #  NODO PROXMOX' al final de esta cabecera.
+#
+#  CAMBIOS v16.0.7 (Socket.io en BACKOFF: "node not found"):
+#   SÍNTOMA: el sitio responde 200 y seis de los siete procesos están RUNNING,
+#   pero 'frappe-bench-node-socketio' queda en BACKOFF con
+#       Error: Cannot start socketio: node not found
+#   mientras 'node -v' en la sesión del operador responde v24 sin problema.
+#   Se pierden notificaciones, chat, progreso de trabajos en vivo y los avisos
+#   de documento modificado. Como el sitio sigue dando 200, el fallo no salta
+#   en ninguna comprobación.
+#
+#   CAUSA: node lo instala nvm en el home del usuario y sólo está en el PATH
+#   de un shell de LOGIN (lo carga .bashrc). Supervisor ejecuta
+#   'bench socketio' como el usuario pero SIN shell de login, así que necesita
+#   enlaces globales. La Fase 7.1 los creaba leyendo ~/.bashcore_node_path...
+#   y la limpieza final BORRABA ese archivo. En cualquier reejecución la fase
+#   se quedaba sin fuente, avisaba y seguía: /usr/bin/node nunca se creaba.
+#
+#   [S1] resolver_node(): cuatro fuentes en cascada —el rastro de la fase de
+#        usuario, un shell de login del usuario, las versiones de nvm en disco
+#        y un node del sistema— y enlazar_node(), idempotente.
+#   [S2] La limpieza final ya no borra .bashcore_node_path. No es un secreto y
+#        es la fuente que necesitan la Fase 7.1 y '--reparar'.
+#   [S3] '--reparar' repara los enlaces de node y verifica Socket.io.
+#   [S4] La validación final comprueba /usr/bin/node y Socket.io RUNNING. Antes
+#        daba el despliegue por bueno con Socket.io muerto.
+#   [S5] El script de arranque espera a que el socket de supervisord RESPONDA
+#        en vez de dormir 5 segundos: de ahí el
+#        FileNotFoundError ... supervisor/xmlrpc.py:557 del primer reinicio.
 #
 #  CAMBIOS v16.0.6 (contraseñas con cualquier carácter):
 #   Las tres preguntas de contraseña rechazaban comillas, backslash, backtick,
@@ -350,7 +378,7 @@ TIMEZONE="America/Managua"   # valor por defecto; la pregunta 6/10 lo cambia
 # la línea de inicio del log. Antes había tres valores distintos conviviendo
 # (v2.x en la cabecera, v1.0.0 en el banner) y era imposible saber, mirando
 # una captura de pantalla, qué versión había corrido de verdad.
-VERSION_SCRIPT="v16.0.6"
+VERSION_SCRIPT="v16.0.7"
 # ---------------------------------------------------------------------------
 #  MATRIZ DE COMPATIBILIDAD (verificada contra los repositorios de Frappe)
 #    campos: rama | python | node | mariadb | apps | SO compatibles
@@ -536,6 +564,52 @@ info()  { echo -e "  ${BLUE}[INFO]${NC} $*"; }
 warn()  { echo -e "  ${YELLOW}[WARN]${NC} $*"; printf '\033[2K  \033[1;33m[WARN]\033[0m %b\n' "$*" >&3; CARD_LINES=0; }
 fail()  { echo -e "  ${RED}[FAIL]${NC} $*";  printf '\033[2K  \033[0;31m[FAIL]\033[0m %b\n' "$*" >&3; CARD_LINES=0; }
 skip()  { echo -e "  ${YELLOW}[SKIP]${NC} $* ${YELLOW}(ya completado)${NC}"; }
+
+# ---------------------------------------------------------------------------
+#  NODE PARA SUPERVISOR  [v16.0.7]
+#  Supervisor ejecuta 'bench socketio' como el usuario operativo pero SIN
+#  shell de login: no lee .bashrc, así que nvm nunca se carga y 'node' no
+#  está en el PATH. Por eso hacen falta enlaces globales.
+#  Este resolutor no depende de ningún archivo temporal: si el rastro que
+#  dejó la fase de usuario ya no está, pregunta por node de otras tres
+#  formas antes de rendirse.
+# ---------------------------------------------------------------------------
+resolver_node() {   # imprime la ruta absoluta de node, o nada
+  local u="${1:-${NEW_USER:-}}" home="${2:-${USER_HOME:-}}" n=""
+  # 1. El rastro de la fase de usuario, si sigue ahí.
+  if [[ -s "${home}/.bashcore_node_path" ]]; then
+    n="$(head -1 "${home}/.bashcore_node_path" 2>/dev/null)"
+    [[ -x "$n" ]] && { printf '%s' "$n"; return 0; }
+  fi
+  # 2. Preguntárselo a un shell de LOGIN del usuario: ahí sí se carga nvm.
+  if [[ -n "$u" ]]; then
+    n="$(su - "$u" -c 'command -v node' 2>/dev/null | tr -d '\r\n')"
+    [[ -x "$n" ]] && { printf '%s' "$n"; return 0; }
+  fi
+  # 3. Rebuscar en las versiones instaladas por nvm y quedarnos con la última.
+  if [[ -n "$home" && -d "${home}/.nvm/versions/node" ]]; then
+    n="$(find "${home}/.nvm/versions/node" -maxdepth 3 -type f -name node -perm -u+x 2>/dev/null | sort -V | tail -1)"
+    [[ -x "$n" ]] && { printf '%s' "$n"; return 0; }
+  fi
+  # 4. Un node del sistema, si alguien lo instaló por apt o nodesource.
+  n="$(command -v node 2>/dev/null)"
+  [[ -x "$n" ]] && { printf '%s' "$n"; return 0; }
+  return 1
+}
+
+# Crea (o repara) los enlaces globales. Idempotente.
+enlazar_node() {
+  local n d
+  n="$(resolver_node "${1:-${NEW_USER:-}}" "${2:-${USER_HOME:-}}")" || return 1
+  d="$(dirname "$n")"
+  mkdir -p "${USRBIN}" "${USRLOCALBIN}" 2>/dev/null
+  ln -sf "$n" "${USRBIN}/node"
+  ln -sf "$n" "${USRLOCALBIN}/node"
+  [[ -x "${d}/npm"  ]] && ln -sf "${d}/npm"  "${USRLOCALBIN}/npm"
+  [[ -x "${d}/yarn" ]] && ln -sf "${d}/yarn" "${USRLOCALBIN}/yarn"
+  printf '%s' "$n"
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 #  ENTRECOMILLADO DE SECRETOS  [v16.0.6]
@@ -2002,6 +2076,24 @@ NGXLOGF
     rm -f /tmp/.bc_ngx0
   fi
 
+  # --- 3.c node para Socket.io ----------------------------------------------
+  # Supervisor lanza 'bench socketio' sin shell de login: sin un node en el
+  # PATH global el proceso queda en BACKOFF. El sitio responde 200 igual, así
+  # que el fallo pasa inadvertido: de ahí que se compruebe explícitamente.
+  say "\n  ${BOLD}3b. node para Socket.io${NC}\n"
+  if [[ -x /usr/bin/node ]]; then
+    r_inf "node: /usr/bin/node -> $(readlink -f /usr/bin/node 2>/dev/null)"
+  else
+    r_bad "/usr/bin/node NO existe: Socket.io no puede arrancar."
+  fi
+  NEW_USER="${UD}" USER_HOME="$(dirname "$BD")" enlazar_node "$UD" "$(dirname "$BD")" > /tmp/.bc_node 2>/dev/null
+  if [[ -s /tmp/.bc_node ]]; then
+    r_act "node enlazado: $(cat /tmp/.bc_node)"
+  else
+    r_bad "no encontré node. Pruébalo con: su - ${UD} -c 'command -v node'"
+  fi
+  rm -f /tmp/.bc_node
+
   # --- 4. Configuración de Supervisor ---------------------------------------
   say "\n  ${BOLD}4. Configuración de Supervisor${NC}\n"
   if [[ -f "${BD}/config/supervisor.conf" ]]; then
@@ -2085,7 +2177,21 @@ for i in $(seq 1 60); do
 done
 [ "$listo" = "1" ] && say "MariaDB lista." || say "AVISO: MariaDB no respondió en 5 min."
 
-systemctl is-active --quiet supervisor || { say "arranco supervisor"; systemctl start supervisor >/dev/null 2>&1; sleep 5; }
+systemctl is-active --quiet supervisor || { say "arranco supervisor"; systemctl start supervisor >/dev/null 2>&1; }
+# 'systemctl start' vuelve cuando el proceso EXISTE, no cuando su socket
+# acepta peticiones. Con 'sleep 5' a ciegas, el primer supervisorctl fallaba
+# con:  FileNotFoundError ... supervisor/xmlrpc.py line: 557
+for i in $(seq 1 30); do
+  supervisorctl pid >/dev/null 2>&1 && break
+  sleep 2
+done
+
+# Red de seguridad: si nvm cambió de versión, el enlace global queda colgando
+# y Socket.io no arranca. Se deja constancia en el log del arranque.
+if [ ! -x /usr/bin/node ]; then
+  say "AVISO: /usr/bin/node no es ejecutable; Socket.io fallará. Ejecuta: bash <script> --reparar"
+fi
+
 supervisorctl reread      >>"$LOG" 2>&1
 supervisorctl update      >>"$LOG" 2>&1
 supervisorctl restart all >>"$LOG" 2>&1
@@ -2168,6 +2274,8 @@ BOOTUNIT
     r_chk "${svc}: corriendo ahora"             systemctl is-active --quiet "$svc"
   done
   r_chk "frappe-boot.service habilitada" systemctl is-enabled frappe-boot.service
+  r_chk "node en el PATH global"         test -x /usr/bin/node
+  r_chk "Socket.io corriendo"            bash -c "supervisorctl status 2>/dev/null | grep -q 'node-socketio.*RUNNING'"
   r_chk "puerto 80 escuchando"           bash -c "ss -H -tln | grep -q ':80[[:space:]]'"
   r_chk "configuración de Nginx válida"  nginx -t
 
@@ -4582,17 +4690,15 @@ else
 fi
 
 # Supervisor necesita 'node' en un PATH global para ejecutar Socket.io.
-if [[ -f "${USER_HOME}/.bashcore_node_path" ]]; then
-  NODE_PATH_BIN="$(cat "${USER_HOME}/.bashcore_node_path")"
-  NODE_DIR_BIN="$(cat "${USER_HOME}/.bashcore_node_dir")"
-  mkdir -p "$USRBIN" "$USRLOCALBIN"
-  ln -sf "$NODE_PATH_BIN" "${USRBIN}/node"
-  ln -sf "$NODE_PATH_BIN" "${USRLOCALBIN}/node"
-  [[ -x "${NODE_DIR_BIN}/npm"  ]] && ln -sf "${NODE_DIR_BIN}/npm"  "${USRLOCALBIN}/npm"
-  [[ -x "${NODE_DIR_BIN}/yarn" ]] && ln -sf "${NODE_DIR_BIN}/yarn" "${USRLOCALBIN}/yarn"
-  ok "node -> ${NODE_PATH_BIN}"
+# [v16.0.7] Ya no se depende de ~/.bashcore_node_path: ese archivo lo borraba
+# la limpieza final, así que en una reejecución la Fase 7.1 se quedaba sin
+# fuente y Socket.io acababa en BACKOFF sin que nada más lo notara.
+if NODE_PATH_BIN="$(enlazar_node)"; then
+  ok "node -> ${NODE_PATH_BIN}  (enlazado en ${USRBIN}/node y ${USRLOCALBIN}/node)"
 else
-  warn "Sin ruta de node del usuario: Socket.io (chat, notificaciones) fallará."
+  fail "No encontré el binario de node por ninguna vía."
+  fail "Socket.io (chat, notificaciones y progreso en vivo) NO arrancará."
+  fail "Compruébalo con:  su - ${NEW_USER} -c 'command -v node'"
 fi
 
 # --- 7.2 bench setup production --------------------------------------------
@@ -4911,7 +5017,21 @@ for i in $(seq 1 60); do
 done
 [ "$listo" = "1" ] && say "MariaDB lista." || say "AVISO: MariaDB no respondió en 5 min."
 
-systemctl is-active --quiet supervisor || { say "arranco supervisor"; systemctl start supervisor >/dev/null 2>&1; sleep 5; }
+systemctl is-active --quiet supervisor || { say "arranco supervisor"; systemctl start supervisor >/dev/null 2>&1; }
+# 'systemctl start' vuelve cuando el proceso EXISTE, no cuando su socket
+# acepta peticiones. Con 'sleep 5' a ciegas, el primer supervisorctl fallaba
+# con:  FileNotFoundError ... supervisor/xmlrpc.py line: 557
+for i in $(seq 1 30); do
+  supervisorctl pid >/dev/null 2>&1 && break
+  sleep 2
+done
+
+# Red de seguridad: si nvm cambió de versión, el enlace global queda colgando
+# y Socket.io no arranca. Se deja constancia en el log del arranque.
+if [ ! -x /usr/bin/node ]; then
+  say "AVISO: /usr/bin/node no es ejecutable; Socket.io fallará. Ejecuta: bash <script> --reparar"
+fi
+
 supervisorctl reread      >>"$LOG" 2>&1
 supervisorctl update      >>"$LOG" 2>&1
 supervisorctl restart all >>"$LOG" 2>&1
@@ -5001,7 +5121,9 @@ if [[ -f "$ENV_FILE" ]]; then
   shred -u "$ENV_FILE" 2>/dev/null || rm -f "$ENV_FILE"
   ok "Archivo temporal de credenciales destruido."
 fi
-rm -f "${USER_HOME}/.bashcore_node_path" "${USER_HOME}/.bashcore_node_dir"
+# [v16.0.7] .bashcore_node_path NO se borra: es la fuente que usa la Fase 7.1
+# y '--reparar' para recrear /usr/bin/node. Borrarlo dejaba a Socket.io sin
+# arreglo posible en la siguiente ejecución. No contiene ningún secreto.
 rm -f "${ETC}/needrestart/conf.d/99-bashcore.conf"
 
 VALID_OK=0; VALID_TOTAL=0
@@ -5018,6 +5140,10 @@ check "MariaDB activo"        systemctl is-active --quiet mariadb
 check "Redis activo"          systemctl is-active --quiet redis-server
 check "Nginx activo"          systemctl is-active --quiet nginx
 check "Supervisor activo"     systemctl is-active --quiet supervisor
+# [v16.0.7] Socket.io caído no rompe el sitio —responde 200 igual— pero deja
+# sin notificaciones, chat ni progreso en vivo. Se comprueba aparte.
+check "node en el PATH global" test -x /usr/bin/node
+check "Socket.io corriendo"   bash -c "supervisorctl status 2>/dev/null | grep -q 'node-socketio.*RUNNING'"
 # [BASHCORE-ARRANQUE-v1] Un servicio "activo" ahora no dice NADA sobre si
 # volverá tras un reinicio. Lo que fallaba era justo esto.
 check "MariaDB arranca solo"    systemctl is-enabled mariadb
