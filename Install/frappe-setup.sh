@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v16.0.9
+#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v16.0.10
 #  https://github.com/izone-ni/frappe-scripts
 #  Despliegue automatizado + hardening de Frappe 15 y 16 / ERPNext
 #  Base: Ubuntu 24.04 LTS   Refs: CIS Ubuntu 24.04 v1.0.0, CIS NGINX v3.0.0
@@ -15,6 +15,27 @@
 #  El script detecta el entorno y se adapta. En un CT hay operaciones que el
 #  kernel del host NO delega al contenedor; se detallan en 'AJUSTES EN EL
 #  NODO PROXMOX' al final de esta cabecera.
+#
+#  CAMBIOS v16.0.10 (banner del cliente igual al de iZone, nombre sin límite):
+#   CAUSA: la pregunta 1/10 cortaba el nombre de la empresa a 24 caracteres
+#   sólo para que cupiera en el encabezado, y el banner lo recortaba además a
+#   14 letras. "Astro Industrial Park S.A" no se podía escribir. Y el banner
+#   del cliente usaba una fuente propia de 5 filas, distinta de la de iZone.
+#
+#   [B1] Sin máximo en la pregunta 1/10: el nombre se guarda y se muestra
+#        completo. Sigue el mínimo de 2 y el veto a comillas (ver ARQUITECTURA
+#        §8, deuda 4).
+#   [B2] banner_empresa usa la fuente de banner_izone (ANSI Shadow, FONT_SOMBRA)
+#        con la primera letra en cian, como el logotipo de iZone.
+#   [B3] Si el nombre no cabe en BANNER_MAX (76) columnas, el banner muestra
+#        sus siglas sin forma jurídica ni conectores ("Astro Industrial Park
+#        S.A" -> AIP) y debajo el nombre completo espaciado, como el
+#        "E N T E R P R I S E" de iZone. Una sola palabra larga se recorta.
+#   [B4] /etc/issue.net sigue en ASCII (los clientes SSH no siempre muestran
+#        UTF-8 antes de autenticarse), pero con las mismas siglas y subtítulo.
+#
+#   VIGILAR: las tablas de resumen recortan a 43 caracteres con "..." (es su
+#   ancho fijo); el nombre completo está en el archivo de metadatos.
 #
 #  CAMBIOS v16.0.9 (sólo Frappe 15/16 y varias llaves SSH):
 #   CAUSA: Frappe 13 y 14 ya no tienen soporte y sólo se daban por
@@ -406,7 +427,7 @@ TIMEZONE="America/Managua"   # valor por defecto; la pregunta 6/10 lo cambia
 # la línea de inicio del log. Antes había tres valores distintos conviviendo
 # (v2.x en la cabecera, v1.0.0 en el banner) y era imposible saber, mirando
 # una captura de pantalla, qué versión había corrido de verdad.
-VERSION_SCRIPT="v16.0.9"
+VERSION_SCRIPT="v16.0.10"
 # ---------------------------------------------------------------------------
 #  MATRIZ DE COMPATIBILIDAD (verificada contra los repositorios de Frappe)
 #    campos: rama | python | node | mariadb | apps | SO compatibles
@@ -516,12 +537,133 @@ declare -A FONT_BLOQUE=(
 
 _glifo() { printf '%s' "${FONT_BLOQUE[$1]:-${FONT_BLOQUE[' ']}}"; }
 
+# ---------------------------------------------------------------------------
+#  BANNER DEL CLIENTE  [v16.0.10]
+#  Misma fuente que banner_izone (ANSI Shadow, 6 filas) y mismo esquema: la
+#  primera letra en cian y, debajo, el nombre espaciado como "E N T E R P R
+#  I S E". Si el nombre no cabe en BANNER_MAX columnas se usan sus siglas:
+#  "Astro Industrial Park S.A" -> AIP. Sólo se abrevia el banner; el nombre
+#  se guarda y se muestra completo en todo lo demás.
+# ---------------------------------------------------------------------------
+BANNER_MAX=76
+declare -A FONT_SOMBRA=(
+  ["A"]=" █████╗ |██╔══██╗|███████║|██╔══██║|██║  ██║|╚═╝  ╚═╝"
+  ["B"]="██████╗ |██╔══██╗|██████╔╝|██╔══██╗|██████╔╝|╚═════╝ "
+  ["C"]=" ██████╗|██╔════╝|██║     |██║     |╚██████╗| ╚═════╝"
+  ["D"]="██████╗ |██╔══██╗|██║  ██║|██║  ██║|██████╔╝|╚═════╝ "
+  ["E"]="███████╗|██╔════╝|█████╗  |██╔══╝  |███████╗|╚══════╝"
+  ["F"]="███████╗|██╔════╝|█████╗  |██╔══╝  |██║     |╚═╝     "
+  ["G"]=" ██████╗ |██╔════╝ |██║  ███╗|██║   ██║|╚██████╔╝| ╚═════╝ "
+  ["H"]="██╗  ██╗|██║  ██║|███████║|██╔══██║|██║  ██║|╚═╝  ╚═╝"
+  ["I"]="██╗|██║|██║|██║|██║|╚═╝"
+  ["J"]="     ██╗|     ██║|     ██║|██   ██║|╚█████╔╝| ╚════╝ "
+  ["K"]="██╗  ██╗|██║ ██╔╝|█████╔╝ |██╔═██╗ |██║  ██╗|╚═╝  ╚═╝"
+  ["L"]="██╗     |██║     |██║     |██║     |███████╗|╚══════╝"
+  ["M"]="███╗   ███╗|████╗ ████║|██╔████╔██║|██║╚██╔╝██║|██║ ╚═╝ ██║|╚═╝     ╚═╝"
+  ["N"]="███╗   ██╗|████╗  ██║|██╔██╗ ██║|██║╚██╗██║|██║ ╚████║|╚═╝  ╚═══╝"
+  ["O"]=" ██████╗ |██╔═══██╗|██║   ██║|██║   ██║|╚██████╔╝| ╚═════╝ "
+  ["P"]="██████╗ |██╔══██╗|██████╔╝|██╔═══╝ |██║     |╚═╝     "
+  ["Q"]=" ██████╗ |██╔═══██╗|██║   ██║|██║▄▄ ██║|╚██████╔╝| ╚══▀▀═╝ "
+  ["R"]="██████╗ |██╔══██╗|██████╔╝|██╔══██╗|██║  ██║|╚═╝  ╚═╝"
+  ["S"]="███████╗|██╔════╝|███████╗|╚════██║|███████║|╚══════╝"
+  ["T"]="████████╗|╚══██╔══╝|   ██║   |   ██║   |   ██║   |   ╚═╝   "
+  ["U"]="██╗   ██╗|██║   ██║|██║   ██║|██║   ██║|╚██████╔╝| ╚═════╝ "
+  ["V"]="██╗   ██╗|██║   ██║|██║   ██║|╚██╗ ██╔╝| ╚████╔╝ |  ╚═══╝  "
+  ["W"]="██╗    ██╗|██║    ██║|██║ █╗ ██║|██║███╗██║|╚███╔███╔╝| ╚══╝╚══╝ "
+  ["X"]="██╗  ██╗|╚██╗██╔╝| ╚███╔╝ | ██╔██╗ |██╔╝ ██╗|╚═╝  ╚═╝"
+  ["Y"]="██╗   ██╗|╚██╗ ██╔╝| ╚████╔╝ |  ╚██╔╝  |   ██║   |   ╚═╝   "
+  ["Z"]="███████╗|╚══███╔╝|  ███╔╝ | ███╔╝  |███████╗|╚══════╝"
+  ["0"]=" ██████╗ |██╔═████╗|██║██╔██║|████╔╝██║|╚██████╔╝| ╚═════╝ "
+  ["1"]=" ██╗|███║|╚██║| ██║| ██║| ╚═╝"
+  ["2"]="██████╗ |╚════██╗| █████╔╝|██╔═══╝ |███████╗|╚══════╝"
+  ["3"]="██████╗ |╚════██╗| █████╔╝| ╚═══██╗|██████╔╝|╚═════╝ "
+  ["4"]="██╗  ██╗|██║  ██║|███████║|╚════██║|     ██║|     ╚═╝"
+  ["5"]="███████╗|██╔════╝|███████╗|╚════██║|███████║|╚══════╝"
+  ["6"]=" ██████╗ |██╔════╝ |███████╗ |██╔═══██╗|╚██████╔╝| ╚═════╝ "
+  ["7"]="███████╗|╚════██║|    ██╔╝|   ██╔╝ |   ██║  |   ╚═╝  "
+  ["8"]=" █████╗ |██╔══██╗|╚█████╔╝|██╔══██╗|╚█████╔╝| ╚════╝ "
+  ["9"]=" █████╗ |██╔══██╗|╚██████║| ╚═══██║| █████╔╝| ╚════╝ "
+  [" "]="   |   |   |   |   |   "
+  ["-"]="      |      |█████╗|╚════╝|      |      "
+  ["."]="   |   |   |   |██╗|╚═╝"
+  ["&"]="   ██╗   |   ██║   |████████╗|██╔═██╔═╝|██████║  |╚═════╝  "
+)
+
+# Mayúsculas sin acentos: la fuente sólo tiene A-Z, 0-9 y '- . &'.
+_rotulo_normal() {
+  local n="${1^^}"
+  n="${n//[ÁÀÄÂáàäâ]/A}"; n="${n//[ÉÈËÊéèëê]/E}"; n="${n//[ÍÌÏÎíìïî]/I}"
+  n="${n//[ÓÒÖÔóòöô]/O}"; n="${n//[ÚÙÜÛúùüû]/U}"; n="${n//[Ññ]/N}"; n="${n//[Çç]/C}"
+  printf '%s' "$n"
+}
+
+# El nombre tal como se pintaría: sin acentos, sin caracteres que la fuente
+# no tiene y con un solo espacio entre palabras.
+_rotulo_limpio() {
+  local n
+  local -a p=()
+  n="$(_rotulo_normal "$1")"; n="${n//[^A-Z0-9&. -]/ }"
+  read -r -a p <<< "$n"
+  printf '%s' "${p[*]:-}"
+}
+
+# Columnas que ocupa un texto en FONT_SOMBRA.
+_sombra_ancho() {
+  local t="$1" i g w=0
+  for (( i=0; i<${#t}; i++ )); do
+    g="${FONT_SOMBRA[${t:i:1}]:-${FONT_SOMBRA[' ']}}"; g="${g%%|*}"
+    w=$(( w + ${#g} ))
+  done
+  printf '%s' "$w"
+}
+
+# Siglas: la inicial de cada palabra, sin forma jurídica ni conectores.
+empresa_siglas() {
+  local n w s=""
+  n="$(_rotulo_normal "$1")"; n="${n//./}"; n="${n//[^A-Z0-9]/ }"
+  for w in $n; do
+    case "$w" in
+      SA|SAS|SAC|SL|SRL|SPA|LTDA|LTD|INC|LLC|CORP|CIA|CV|RL|SC|SCL|SDERL) continue ;;
+      DE|DEL|LA|LAS|LOS|EL|Y|E|THE|OF|AND) continue ;;
+    esac
+    s+="${w:0:1}"
+  done
+  printf '%s' "$s"
+}
+
+# Lo que se pinta en grande: el nombre si cabe; si no, sus siglas; y si es
+# una sola palabra, lo que quepa de ella.
+empresa_rotulo() {
+  local n s
+  n="$(_rotulo_limpio "$1")"
+  if (( $(_sombra_ancho "$n") <= BANNER_MAX )); then
+    printf '%s' "$n"; return 0
+  fi
+  s="$(empresa_siglas "$1")"
+  if (( ${#s} < 2 )); then s="${n%% *}"; fi
+  while (( ${#s} > 1 && $(_sombra_ancho "$s") > BANNER_MAX )); do
+    s="${s:0:${#s}-1}"
+  done
+  printf '%s' "$s"
+}
+
+# Subtítulo con el nombre completo, sólo cuando el banner lo abrevia. Va
+# espaciado como el de iZone si cabe; si no, tal cual.
+empresa_subtitulo() {
+  local nombre="${1^^}" rot="$2" i sub=""
+  [[ "$rot" != "$(_rotulo_limpio "$1")" ]] || return 0
+  for (( i=0; i<${#nombre}; i++ )); do sub+="${nombre:i:1} "; done
+  sub="${sub% }"
+  (( ${#sub} > BANNER_MAX )) && sub="$nombre"
+  (( ${#sub} > BANNER_MAX )) && sub="${sub:0:BANNER_MAX-1}…"
+  printf '%s' "$sub"
+}
+
 # Igual que banner_empresa pero en texto plano, para archivos como
 # /etc/issue.net donde los códigos de color no siempre se interpretan.
 banner_empresa_texto() {
-  local nombre="${1:-}" i c fila glifo trozo
-  nombre="${nombre^^}"
-  (( ${#nombre} > 14 )) && nombre="${nombre:0:14}"
+  local nombre i c fila glifo trozo sub
+  nombre="$(empresa_rotulo "${1:-}")"
   for fila in 1 2 3 4 5; do
     trozo=""
     for (( i=0; i<${#nombre}; i++ )); do
@@ -532,27 +674,36 @@ banner_empresa_texto() {
     done
     printf '  %s\n' "${trozo//#/#}"
   done
+  sub="$(empresa_subtitulo "${1:-}" "$nombre")"
+  [[ -n "$sub" ]] && printf '\n  %s\n' "$sub"
+  return 0
 }
 
-# Banner de la empresa en letras de bloque, con el mismo estilo que iZone.
+# Banner de la empresa con la misma fuente y colores que banner_izone.
 banner_empresa() {
-  local nombre="${1:-}" i c fila glifo trozo
-  nombre="${nombre^^}"
-  (( ${#nombre} > 14 )) && nombre="${nombre:0:14}"
-  say "\n"
-  for fila in 1 2 3 4 5; do
-    trozo=""
-    for (( i=0; i<${#nombre}; i++ )); do
-      c="${nombre:i:1}"
-      glifo="$(_glifo "$c")"
-      # extraer la fila N del glifo (campos separados por '|')
-      trozo+="$(printf '%s' "$glifo" | cut -d'|' -f"$fila")"
-      trozo+=" "
+  local rot sub i f g ancho pad
+  local -a filas=("" "" "" "" "" "") partes=()
+  rot="$(empresa_rotulo "${1:-}")"
+  for (( i=0; i<${#rot}; i++ )); do
+    g="${FONT_SOMBRA[${rot:i:1}]:-${FONT_SOMBRA[' ']}}"
+    IFS='|' read -r -a partes <<< "$g"
+    for f in 0 1 2 3 4 5; do
+      if (( i == 0 )); then
+        filas[f]+="\033[0;36m\033[1m${partes[f]}\033[0m"
+      else
+        filas[f]+="${partes[f]}"
+      fi
     done
-    trozo="${trozo//#/█}"
-    printf '  \033[0;36m\033[1m%s\033[0m\n' "$trozo" >&3
   done
   say "\n"
+  for f in 0 1 2 3 4 5; do printf '  %b\n' "${filas[f]}" >&3; done
+  sub="$(empresa_subtitulo "${1:-}" "$rot")"
+  if [[ -n "$sub" ]]; then
+    ancho="$(_sombra_ancho "$rot")"
+    pad=$(( (ancho - ${#sub}) / 2 )); (( pad < 0 )) && pad=0
+    printf '  %*s\033[1m%s\033[0m\n' "$pad" "" "$sub" >&3
+  fi
+  return 0
 }
 
 # Pregunta sí/no. El prompt sale por la terminal (fd 3) y la respuesta se lee
@@ -2536,15 +2687,12 @@ phase "PARÁMETROS DE DESPLIEGUE (10 preguntas)"
 # --- 1) Nombre de la empresa -------------------------------------------------
 pantalla "Parámetros del despliegue  ·  1 de 10"
 say "${YELLOW}Tras estas 10 preguntas, el resto es desatendido.${NC}\n\n"
-say "${BOLD}1/10${NC} Nombre de la empresa (sale en el encabezado): "
+say "${BOLD}1/10${NC} Nombre de la empresa (si es largo, el encabezado usa sus siglas): "
 while :; do
   read -r EMPRESA
   EMPRESA="$(trim "$EMPRESA")"
   if (( ${#EMPRESA} < 2 )); then
     fail "Escribe al menos 2 caracteres."; say "     > "; continue
-  fi
-  if (( ${#EMPRESA} > 24 )); then
-    fail "Demasiado largo: máximo 24 caracteres."; say "     > "; continue
   fi
   case "$EMPRESA" in
     *[\\\'\"\`\$]*) fail "No admite comillas, backslash, backtick ni \$. Quítalos."; say "     > "; continue ;;
