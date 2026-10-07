@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v16.0.10
+#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v16.0.11
 #  https://github.com/izone-ni/frappe-scripts
 #  Despliegue automatizado + hardening de Frappe 15 y 16 / ERPNext
 #  Base: Ubuntu 24.04 LTS   Refs: CIS Ubuntu 24.04 v1.0.0, CIS NGINX v3.0.0
@@ -15,6 +15,35 @@
 #  El script detecta el entorno y se adapta. En un CT hay operaciones que el
 #  kernel del host NO delega al contenedor; se detallan en 'AJUSTES EN EL
 #  NODO PROXMOX' al final de esta cabecera.
+#
+#  CAMBIOS v16.0.11 (arm64: Raspberry Pi con Ubuntu 26.04):
+#   CAUSA: hacía falta instalar Frappe 16 en arm64 (Raspberry Pi 5, Ubuntu
+#   26.04). Lo esencial ya funcionaba: el .deb de wkhtmltopdf se elige con
+#   ${ARCH}, y MariaDB 11.8.8, Node 24, Python 3.14 y los wheels con C se
+#   publican para arm64 (comprobado contra cada fuente). Faltaban los ajustes
+#   propios de una placa con poca RAM, sin reloj con batería y en microSD.
+#
+#   REGLA: todo va en bloques 'if [[ "$ARCH" == "arm64" ]]' marcados [ARM].
+#   En amd64 el script hace exactamente lo mismo que en v16.0.10: este cambio
+#   sólo AÑADE líneas; no modifica ni borra ninguna existente.
+#
+#   [A1] Fase 0: placa, páginas del kernel (avisa si no son de 4 KB), raíz en
+#        microSD y espera de hasta 90 s a que NTP sincronice el reloj: sin
+#        hora correcta, apt rechaza los repositorios con "not valid yet".
+#   [A2] En microSD, si hace falta swap, 2 GB en vez de 4.
+#   [A3] zz-arm64.cnf: innodb_buffer_pool_size al 25 % de la RAM (2 GB con
+#        8 GB). La desinstalación lo retira.
+#   [A4] gunicorn_workers: uno por cada 2 GB de RAM (4 con 8 GB, en vez de los
+#        9 de bench), en common_site_config.json: sobrevive a 'bench setup
+#        supervisor' y a '--reparar'.
+#   [A5] wkhtmltopdf: si el build 0.12.6.1-2 no queda operativo, se prueba el
+#        0.12.6.1-3. Ubuntu 26.04 ya no trae el paquete wkhtmltopdf.
+#   [A6] Los dos resúmenes muestran la arquitectura y la placa.
+#
+#   VIGILAR: falta la prueba en una Pi real. Los tiempos límite de la fase de
+#   usuario (bench init 60 min, build 40 min) son los de amd64 y en microSD
+#   pueden quedarse cortos. [A3] y el swap de [A2] sólo actúan en una
+#   instalación nueva: 'fase2_config' y 'swap' tienen checkpoint.
 #
 #  CAMBIOS v16.0.10 (banner del cliente igual al de iZone, nombre sin límite):
 #   CAUSA: la pregunta 1/10 cortaba el nombre de la empresa a 24 caracteres
@@ -427,7 +456,7 @@ TIMEZONE="America/Managua"   # valor por defecto; la pregunta 6/10 lo cambia
 # la línea de inicio del log. Antes había tres valores distintos conviviendo
 # (v2.x en la cabecera, v1.0.0 en el banner) y era imposible saber, mirando
 # una captura de pantalla, qué versión había corrido de verdad.
-VERSION_SCRIPT="v16.0.10"
+VERSION_SCRIPT="v16.0.11"
 # ---------------------------------------------------------------------------
 #  MATRIZ DE COMPATIBILIDAD (verificada contra los repositorios de Frappe)
 #    campos: rama | python | node | mariadb | apps | SO compatibles
@@ -1861,6 +1890,7 @@ desinstalar() {
   DEBIAN_FRONTEND=noninteractive apt-get autoremove -y >/dev/null 2>&1 || true
   rm -rf "${ETC}/mysql/mariadb.conf.d/frappe.cnf" "${ETC}/mysql/mariadb.conf.d/zz-lxc.cnf" \
          "${VARDIR}/lib/mysql" "${ETC}/apt/sources.list.d/"mariadb* 2>/dev/null || true
+  rm -f "${ETC}/mysql/mariadb.conf.d/zz-arm64.cnf" 2>/dev/null || true   # [ARM]
 
   # 6. Herramientas del usuario operativo
   if [[ -n "${USER_DETECTADO:-}" ]]; then
@@ -2615,6 +2645,49 @@ if [[ -z "$BC_PREFIX" && ! -d /run/systemd/system ]]; then
   exit 1
 fi
 
+# --- [ARM] Comprobaciones propias de arm64 (Raspberry Pi y similares) -------
+# Sólo en arm64; en amd64 este bloque no hace nada. Avisa, no bloquea.
+ARM_PLACA=""
+if [[ "$ARCH" == "arm64" ]]; then
+  if [[ -r /proc/device-tree/model ]]; then
+    ARM_PLACA="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)"
+    [[ -n "$ARM_PLACA" ]] && info "Placa: ${ARM_PLACA}"
+  fi
+  # Redis (jemalloc) y otros binarios de los repositorios asumen páginas de
+  # 4 KB. Un kernel de 16 KB, como el de Raspberry Pi OS en la Pi 5, los tumba.
+  ARM_PAGINA="$(getconf PAGESIZE 2>/dev/null || echo 0)"
+  if [[ "$ARM_PAGINA" == "4096" ]]; then
+    ok "Páginas del kernel: 4096 bytes."
+  else
+    warn "Kernel con páginas de ${ARM_PAGINA} bytes: Redis o MariaDB pueden no arrancar."
+    warn "Usa Ubuntu Server para Raspberry Pi, que trae páginas de 4 KB."
+  fi
+  # Raíz en microSD: más lenta y con desgaste por escritura.
+  case "$(findmnt -n -o SOURCE / 2>/dev/null || true)" in
+    /dev/mmcblk*)
+      warn "El sistema está en una microSD: la instalación será más lenta."
+      info "Para producción conviene un SSD (NVMe o USB)."
+      # Si hiciera falta swap (menos de ~4 GB de RAM), 2 GB en vez de 4:
+      # menos escrituras sobre la tarjeta. Con 8 GB no se crea swap.
+      SWAP_SIZE="2G" ;;
+  esac
+  # La Pi no trae reloj con batería: hasta que NTP sincroniza, la fecha puede
+  # ir atrasada y apt rechaza los repositorios con "is not valid yet".
+  if [[ -z "$BC_PREFIX" ]] && command -v timedatectl >/dev/null 2>&1; then
+    for _i in $(seq 45); do
+      [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" == "yes" ]] && break
+      (( _i == 1 )) && info "Esperando a que el reloj se sincronice por NTP (hasta 90 s)..."
+      sleep 2
+    done
+    if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" == "yes" ]]; then
+      ok "Reloj sincronizado: $(date '+%Y-%m-%d %H:%M')"
+    else
+      warn "El reloj no está sincronizado ($(date '+%Y-%m-%d %H:%M'))."
+      warn "Si apt falla con 'not valid yet', corrige la hora y relanza."
+    fi
+  fi
+fi
+
 MEM_MB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
 SWAP_MB=$(awk '/SwapTotal/{print int($2/1024)}' /proc/meminfo)
 ok "RAM: ${MEM_MB}MB | Swap: ${SWAP_MB}MB"
@@ -3036,6 +3109,9 @@ tabla_titulo "RESUMEN DE LA OPERACIÓN"
 tabla_sep
 tabla_fila "Empresa"          "${EMPRESA}"
 tabla_fila "Sistema"          "$(so_actual)"
+if [[ "$ARCH" == "arm64" ]]; then   # [ARM]
+  tabla_fila "Arquitectura"   "arm64${ARM_PLACA:+ · ${ARM_PLACA}}"
+fi
 tabla_fila "Frappe"           "${FRAPPE_BRANCH}"
 tabla_fila "Aplicaciones"     "$(apps_bonitas "${APPS_SEL}")"
 tabla_fila "Sitio"            "${SITE_NAME}"
@@ -3762,6 +3838,22 @@ LXCOVR
     ok "zz-lxc.cnf y override de systemd escritos."
   fi
 
+  # --- [ARM] Memoria de InnoDB acorde a la placa -------------------------
+  # MariaDB arranca con 128 MB de buffer pool. En una placa dedicada sobra
+  # RAM: el 25 % (2 GB con 8 GB) mantiene las tablas de Frappe en memoria y
+  # ahorra lecturas a la tarjeta. Archivo propio, como zz-lxc.cnf.
+  if [[ "$ARCH" == "arm64" ]]; then
+    ARM_POOL_MB=$(( (MEM_MB + 512) / 1024 * 1024 / 4 ))
+    (( ARM_POOL_MB < 256 )) && ARM_POOL_MB=256
+    cat > "${ETC}/mysql/mariadb.conf.d/zz-arm64.cnf" <<ARMCNF
+[mysqld]
+# Generado por bashcore-frappe en arm64: 25 % de ${MEM_MB} MB de RAM.
+innodb_buffer_pool_size = ${ARM_POOL_MB}M
+ARMCNF
+    chmod 644 "${ETC}/mysql/mariadb.conf.d/zz-arm64.cnf"
+    ok "zz-arm64.cnf: innodb_buffer_pool_size = ${ARM_POOL_MB}M."
+  fi
+
   info "Habilitando y reiniciando el servicio..."
   systemctl enable --now mariadb 2>/dev/null || true
 
@@ -3986,6 +4078,28 @@ else
   else
     warn "wkhtmltopdf NO quedó operativo. La impresión de PDF fallará."
     warn "El resto de la instalación continúa; se puede arreglar después."
+  fi
+fi
+
+# --- [ARM] Segundo intento de wkhtmltopdf en arm64 --------------------------
+# Ubuntu 26.04 ya no trae el paquete wkhtmltopdf: no hay alternativa en apt.
+# Si el build de arriba no quedó operativo, se prueba 0.12.6.1-3, el otro
+# publicado para jammy_arm64 (mismas dependencias, resueltas en 26.04).
+if [[ "$ARCH" == "arm64" ]] && ! is_done fase3_wkhtmltopdf; then
+  WK_DEB="wkhtmltox_0.12.6.1-3.jammy_arm64.deb"
+  WK_URL="https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-3/${WK_DEB}"
+  info "Reintentando wkhtmltopdf con ${WK_DEB}..."
+  if ( cd /tmp && wget -q "$WK_URL" ); then
+    dpkg -i "/tmp/${WK_DEB}" 2>/dev/null || true
+    apt_do install -f -y || true
+    rm -f "/tmp/${WK_DEB}"
+  fi
+  WK_VER="$(wkhtmltopdf --version 2>/dev/null || true)"
+  if [[ -n "$WK_VER" ]]; then
+    ok "wkhtmltopdf: ${WK_VER}"
+    mark_done fase3_wkhtmltopdf
+  else
+    warn "wkhtmltopdf sigue sin funcionar en arm64: los PDF no se generarán."
   fi
 fi
 
@@ -4932,6 +5046,37 @@ else
   fail "Compruébalo con:  su - ${NEW_USER} -c 'command -v node'"
 fi
 
+# --- [ARM] Workers de gunicorn acordes a la placa ---------------------------
+# bench crea núcleos×2+1 workers (9 en una Pi 5) y cada uno ocupa ~200 MB.
+# Se deja uno por cada 2 GB de RAM (4 con 8 GB). Va en common_site_config.json,
+# así que sobrevive a 'bench setup supervisor' y a '--reparar'.
+ARM_CFG="${BENCH_DIR}/sites/common_site_config.json"
+if [[ "$ARCH" == "arm64" && -f "$ARM_CFG" ]]; then
+  ARM_MAX=$(( $(nproc 2>/dev/null || echo 1) * 2 + 1 ))
+  ARM_WORKERS=$(( (MEM_MB + 1023) / 2048 ))
+  (( ARM_WORKERS < 2 )) && ARM_WORKERS=2
+  (( ARM_WORKERS > ARM_MAX )) && ARM_WORKERS=$ARM_MAX
+  if python3 - "$ARM_CFG" "$ARM_WORKERS" <<'PYGW'
+import json, os, shutil, sys
+ruta, n = sys.argv[1], int(sys.argv[2])
+with open(ruta, encoding="utf-8") as f:
+    cfg = json.load(f)
+cfg["gunicorn_workers"] = n
+tmp = ruta + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=1, sort_keys=True)
+    f.write("\n")
+shutil.copymode(ruta, tmp)
+os.replace(tmp, ruta)
+PYGW
+  then
+    chown "${NEW_USER}:${NEW_USER}" "$ARM_CFG"
+    ok "gunicorn_workers = ${ARM_WORKERS} (bench habría puesto ${ARM_MAX})."
+  else
+    warn "No pude fijar gunicorn_workers; bench usará ${ARM_MAX}."
+  fi
+fi
+
 # --- 7.2 bench setup production --------------------------------------------
 if is_done fase7_production; then
   skip "bench setup production"
@@ -5443,6 +5588,9 @@ tabla_sep
 tabla_fila "Validaciones"     "${VALID_OK}/${VALID_TOTAL} correctas"
 tabla_fila "Empresa"          "${EMPRESA}"
 tabla_fila "Sistema"          "$(so_actual)"
+if [[ "$ARCH" == "arm64" ]]; then   # [ARM]
+  tabla_fila "Arquitectura"   "arm64${ARM_PLACA:+ · ${ARM_PLACA}}"
+fi
 tabla_fila "Frappe"           "${FRAPPE_BRANCH}"
 tabla_fila "Aplicaciones"     "$( [[ -f "${USER_HOME}/.bashcore_apps" ]] && apps_bonitas "$(tr '\n' ' ' < "${USER_HOME}/.bashcore_apps")" || apps_bonitas "${APPS_SEL}" )"
 tabla_sep
