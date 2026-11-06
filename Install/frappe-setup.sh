@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v16.0.12
+#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v16.0.13
 #  https://github.com/izone-ni/frappe-scripts
 #  Despliegue automatizado + hardening de Frappe 15 y 16 / ERPNext
 #  Base: Ubuntu 24.04 LTS   Refs: CIS Ubuntu 24.04 v1.0.0, CIS NGINX v3.0.0
@@ -16,6 +16,20 @@
 #  El script detecta el entorno y se adapta. En un CT hay operaciones que el
 #  kernel del host NO delega al contenedor; se detallan en 'AJUSTES EN EL
 #  NODO PROXMOX' al final de esta cabecera.
+#
+#  CAMBIOS v16.0.13 (atajos: el sitio activo no se encontraba):
+#   CAUSA: en Frappe 15 y 16, 'bench use' guarda el sitio como default_site
+#   en sites/common_site_config.json, no en sites/currentsite.txt. Los atajos
+#   sólo leían currentsite.txt y respondían "No hay sitio activo" en un
+#   servidor recién instalado, aunque el sitio sí estaba fijado.
+#
+#   [T5] _fa_sitio busca el sitio en este orden: FRAPPE_SITE, default_site,
+#        currentsite.txt y, si el bench sólo tiene uno, ese.
+#   [T6] Los atajos de un sitio aceptan otro como argumento, sólo para esa
+#        orden: 'migrate otro.local', 'deploy otro.local', 'maint on otro.local'.
+#        Un sitio que no existe es un error: nunca se aplica al activo.
+#   [T7] ATAJOS_VERSION 2: '--atajos' reemplaza el archivo de los servidores
+#        con la v1 y deja la anterior en ~/.frappe-atajos.sh.bak.
 #
 #  CAMBIOS v16.0.12 (atajos de bench):
 #   CAUSA: cada comando de bench obliga a entrar en el bench y a repetir el
@@ -482,7 +496,7 @@ TIMEZONE="America/Managua"   # valor por defecto; la pregunta 6/10 lo cambia
 # la línea de inicio del log. Antes había tres valores distintos conviviendo
 # (v2.x en la cabecera, v1.0.0 en el banner) y era imposible saber, mirando
 # una captura de pantalla, qué versión había corrido de verdad.
-VERSION_SCRIPT="v16.0.12"
+VERSION_SCRIPT="v16.0.13"
 # ---------------------------------------------------------------------------
 #  MATRIZ DE COMPATIBILIDAD (verificada contra los repositorios de Frappe)
 #    campos: rama | python | node | mariadb | apps | SO compatibles
@@ -1992,7 +2006,7 @@ desinstalar() {
 #
 # Sube ATAJOS_VERSION cada vez que cambies el contenido: así se ve en la
 # primera línea del archivo instalado qué versión tiene cada servidor.
-ATAJOS_VERSION="1"
+ATAJOS_VERSION="2"
 
 atajos_contenido() {
   printf '# frappe-atajos v%s · generado por frappe-setup.sh\n' "$ATAJOS_VERSION"
@@ -2013,13 +2027,33 @@ case $- in *i*) ;; *) return 0 ;; esac
 : "${FRAPPE_BENCH:=$HOME/frappe-bench}"
 
 # --- Base ----------------------------------------------------------------------
-# El sitio activo: FRAPPE_SITE si está puesta; si no, el que fijó 'bench use'.
+# ¿Es un sitio de este bench?
+_fa_es_sitio() { [ -n "${1:-}" ] && [ -f "$FRAPPE_BENCH/sites/$1/site_config.json" ]; }
+
+# El sitio activo, en este orden:
+#   1. FRAPPE_SITE, si está puesta.
+#   2. default_site de sites/common_site_config.json: lo escribe 'bench use'
+#      en Frappe 15 y 16.
+#   3. sites/currentsite.txt, donde lo guardaban versiones antiguas.
+#   4. El único sitio del bench, si sólo hay uno.
 _fa_sitio() {
+  local s="" d n=0 unico=""
   if [ -n "${FRAPPE_SITE:-}" ]; then printf '%s\n' "$FRAPPE_SITE"; return 0; fi
-  if [ -s "$FRAPPE_BENCH/sites/currentsite.txt" ]; then
-    head -n 1 "$FRAPPE_BENCH/sites/currentsite.txt" | tr -d '[:space:]'; echo
-    return 0
+  if [ -f "$FRAPPE_BENCH/sites/common_site_config.json" ]; then
+    s="$(sed -n 's/.*"default_site"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+          "$FRAPPE_BENCH/sites/common_site_config.json" | head -n 1)"
   fi
+  if [ -z "$s" ] && [ -s "$FRAPPE_BENCH/sites/currentsite.txt" ]; then
+    s="$(head -n 1 "$FRAPPE_BENCH/sites/currentsite.txt" | tr -d '[:space:]')"
+  fi
+  if [ -z "$s" ]; then
+    for d in "$FRAPPE_BENCH"/sites/*/; do
+      [ -f "${d}site_config.json" ] || continue
+      n=$((n + 1)); unico="$(basename "$d")"
+    done
+    [ "$n" -eq 1 ] && s="$unico"
+  fi
+  if [ -n "$s" ]; then printf '%s\n' "$s"; return 0; fi
   echo "No hay sitio activo. Fíjalo con: sitio <nombre>" >&2
   return 1
 }
@@ -2039,20 +2073,46 @@ _fs() {
   _fb --site "$s" "$@"
 }
 
+# Como _fs, pero si el primer argumento tras el comando es un sitio del bench,
+# se usa ese sitio sólo esta vez: 'migrate otro.local'.
+_fsx() {
+  local cmd="$1" s
+  shift
+  if _fa_es_sitio "${1:-}"; then
+    s="$1"; shift
+    _fb --site "$s" "$cmd" "$@"
+  else
+    _fs "$cmd" "$@"
+  fi
+}
+
+# _fsen <sitio|''> comando...: con sitio, ése (si existe); vacío, el activo.
+# Un sitio mal escrito es un error: nunca se aplica al activo por descuido.
+_fsen() {
+  local s="$1"
+  shift
+  if [ -z "$s" ]; then _fs "$@"; return; fi
+  if ! _fa_es_sitio "$s"; then
+    echo "No existe el sitio «$s» en $FRAPPE_BENCH/sites" >&2; return 1
+  fi
+  _fb --site "$s" "$@"
+}
+
 _fa_paso() { printf '\033[1;36m>\033[0m %s\n' "$*"; }
 _fa_uso()  { printf 'Uso: %s\n' "$*" >&2; return 2; }
 
 # --- Día a día -------------------------------------------------------------------
-migrate()     { _fs migrate "$@"; }
+# Los que actúan sobre un sitio aceptan otro como primer argumento.
+migrate()     { _fsx migrate "$@"; }
 restart()     { _fb restart "$@"; }
-console()     { _fs console "$@"; }
-fdb()         { _fs mariadb "$@"; }        # 'mariadb' ya es el cliente del sistema
-list-apps()   { _fs list-apps "$@"; }
+console()     { _fsx console "$@"; }
+fdb()         { _fsx mariadb "$@"; }       # 'mariadb' ya es el cliente del sistema
+list-apps()   { _fsx list-apps "$@"; }
 version()     { _fb version "$@"; }
-backup()      { _fs backup --with-files "$@"; }
-doctor()      { _fs doctor "$@"; }
+backup()      { _fsx backup "$@" --with-files; }
+doctor()      { _fsx doctor "$@"; }
 fwatch()      { _fb watch "$@"; }          # 'watch' ya es un programa de Ubuntu
-clear-cache() { _fs clear-cache && _fs clear-website-cache; }
+clear-cache() { _fsx clear-cache "$@" && _fsx clear-website-cache "$@"; }
 
 # build compila para todo el bench: no lleva sitio. 'build hrms' sólo esa app.
 build() {
@@ -2062,26 +2122,30 @@ build() {
   esac
 }
 
+# maint on|off [sitio]
 maint() {
   case "${1:-}" in
-    on|off) _fs set-maintenance-mode "$1" ;;
-    *) _fa_uso "maint on|off" ;;
+    on|off) _fsen "${2:-}" set-maintenance-mode "$1" ;;
+    *) _fa_uso "maint on|off [sitio]" ;;
   esac
 }
 
+# scheduler on|off|status [sitio]
 scheduler() {
+  local accion
   case "${1:-}" in
-    on)  _fs scheduler enable ;;
-    off) _fs scheduler disable ;;
-    status|pause|resume) _fs scheduler "$1" ;;
-    *) _fa_uso "scheduler on|off|status" ;;
+    on)  accion=enable ;;
+    off) accion=disable ;;
+    status|pause|resume) accion="$1" ;;
+    *) _fa_uso "scheduler on|off|status [sitio]"; return ;;
   esac
+  _fsen "${2:-}" scheduler "$accion"
 }
 
 # --- Apps ------------------------------------------------------------------------
 install-app() {
-  [ $# -gt 0 ] || { _fa_uso "install-app <app> [app...]"; return; }
-  _fs install-app "$@"
+  [ $# -gt 0 ] || { _fa_uso "install-app [sitio] <app> [app...]"; return; }
+  _fsx install-app "$@"
 }
 
 # ¿Es un enlace? URL, ruta local o el atajo de una llave (github-x:org/repo).
@@ -2140,22 +2204,33 @@ add() {
 
 # --- Combinaciones -----------------------------------------------------------------
 _fa_deploy_fallo() {
-  printf '\033[1;31mX\033[0m Falló «%s». El sitio sigue en modo mantenimiento.\n' "$1" >&2
-  echo "  Corrige el error y vuelve a ejecutar deploy, o quítalo con: maint off" >&2
+  printf '\033[1;31mX\033[0m Falló «%s». El sitio %s sigue en modo mantenimiento.\n' "$1" "$2" >&2
+  echo "  Corrige el error y vuelve a ejecutar deploy, o quítalo con: maint off $2" >&2
 }
 
-# Lo de siempre después de actualizar una app. Se detiene en el primer fallo
-# y deja el mantenimiento puesto: nadie entra a un sitio a medio migrar.
+# deploy [sitio]. Lo de siempre después de actualizar una app. Se detiene en
+# el primer fallo y deja el mantenimiento puesto: nadie entra a un sitio a
+# medio migrar.
 deploy() {
-  _fa_sitio >/dev/null || return 1
+  local s
+  if [ -n "${1:-}" ]; then
+    if ! _fa_es_sitio "$1"; then
+      echo "No existe el sitio «$1» en $FRAPPE_BENCH/sites" >&2; return 1
+    fi
+    s="$1"
+  else
+    s="$(_fa_sitio)" || return 1
+  fi
+  _fa_paso "Sitio: $s"
   _fa_paso "1/6 mantenimiento on"
-  _fs set-maintenance-mode on || { echo "No se pudo activar el mantenimiento: no hice nada más." >&2; return 1; }
-  _fa_paso "2/6 migrate";     _fs migrate  || { _fa_deploy_fallo migrate; return 1; }
-  _fa_paso "3/6 build";       _fb build    || { _fa_deploy_fallo build; return 1; }
-  _fa_paso "4/6 clear-cache"; clear-cache  || { _fa_deploy_fallo clear-cache; return 1; }
-  _fa_paso "5/6 restart";     _fb restart  || { _fa_deploy_fallo restart; return 1; }
+  _fb --site "$s" set-maintenance-mode on || { echo "No se pudo activar el mantenimiento: no hice nada más." >&2; return 1; }
+  _fa_paso "2/6 migrate";     _fb --site "$s" migrate || { _fa_deploy_fallo migrate "$s"; return 1; }
+  _fa_paso "3/6 build";       _fb build               || { _fa_deploy_fallo build "$s"; return 1; }
+  _fa_paso "4/6 clear-cache"
+  { _fb --site "$s" clear-cache && _fb --site "$s" clear-website-cache; } || { _fa_deploy_fallo clear-cache "$s"; return 1; }
+  _fa_paso "5/6 restart";     _fb restart             || { _fa_deploy_fallo restart "$s"; return 1; }
   _fa_paso "6/6 mantenimiento off"
-  _fs set-maintenance-mode off || { echo "Todo aplicado, pero el mantenimiento sigue puesto. Quítalo con: maint off" >&2; return 1; }
+  _fb --site "$s" set-maintenance-mode off || { echo "Todo aplicado, pero el mantenimiento sigue puesto. Quítalo con: maint off $s" >&2; return 1; }
   echo "deploy terminado."
 }
 
@@ -2283,32 +2358,32 @@ atajos() {
   local s
   s="$(_fa_sitio 2>/dev/null)" || s="(ninguno: usa 'sitio <nombre>')"
   printf '\nAtajos de bench   bench: %s   sitio: %s\n\n' "$FRAPPE_BENCH" "$s"
-  printf '  %-30s %s\n' \
-    "migrate"                    "bench --site <sitio> migrate" \
-    "build [app]"                "bench build [--app <app>]" \
-    "restart"                    "bench restart" \
-    "clear-cache"                "clear-cache + clear-website-cache" \
-    "console"                    "bench --site <sitio> console" \
-    "fdb"                        "bench --site <sitio> mariadb" \
-    "list-apps"                  "bench --site <sitio> list-apps" \
-    "version"                    "bench version" \
-    "backup"                     "bench --site <sitio> backup --with-files" \
-    "doctor"                     "bench --site <sitio> doctor" \
-    "maint on|off"               "set-maintenance-mode on|off" \
-    "scheduler on|off|status"    "scheduler enable|disable|status" \
-    "fwatch"                     "bench watch" \
+  printf '  %-34s %s\n' \
+    "migrate [sitio]"                "bench --site <sitio> migrate" \
+    "build [app]"                    "bench build [--app <app>]" \
+    "restart"                        "bench restart" \
+    "clear-cache [sitio]"            "clear-cache + clear-website-cache" \
+    "console [sitio]"                "bench --site <sitio> console" \
+    "fdb [sitio]"                    "bench --site <sitio> mariadb" \
+    "list-apps [sitio]"              "bench --site <sitio> list-apps" \
+    "version"                        "bench version" \
+    "backup [sitio]"                 "bench --site <sitio> backup --with-files" \
+    "doctor [sitio]"                 "bench --site <sitio> doctor" \
+    "maint on|off [sitio]"           "set-maintenance-mode on|off" \
+    "scheduler on|off|status [sitio]" "scheduler enable|disable|status" \
+    "fwatch"                         "bench watch" \
     "" "" \
-    "add <app> <enlace> [rama]"  "bench get-app --branch <rama> <enlace>" \
-    "install-app <app>"          "bench --site <sitio> install-app <app>" \
-    "llaves [cantidad]"          "llaves SSH con contraseña + ~/.ssh/config" \
+    "add <app> <enlace> [rama]"      "bench get-app --branch <rama> <enlace>" \
+    "install-app [sitio] <app>"      "bench --site <sitio> install-app <app>" \
+    "llaves [cantidad]"              "llaves SSH con contraseña + ~/.ssh/config" \
     "" "" \
-    "deploy"                     "mantenimiento, migrate, build, caché, restart" \
-    "logs [web|worker|...]"      "tail -F logs/<proceso>.error.log" \
-    "estado"                     "supervisorctl status + doctor" \
-    "sitio [nombre]"             "ver o cambiar el sitio activo" \
-    "bcd"                        "cd al bench" \
-    "b <comando>"                "cualquier otro comando de bench"
-  printf '\n  bench sigue funcionando igual.\n\n'
+    "deploy [sitio]"                 "mantenimiento, migrate, build, caché, restart" \
+    "logs [web|worker|...]"          "tail -F logs/<proceso>.error.log" \
+    "estado"                         "supervisorctl status + doctor" \
+    "sitio [nombre]"                 "ver o cambiar el sitio activo" \
+    "bcd"                            "cd al bench" \
+    "b <comando>"                    "cualquier otro comando de bench"
+  printf '\n  Sin [sitio] se usa el activo. bench sigue funcionando igual.\n\n'
 }
 
 # Atajos propios, que frappe-setup.sh nunca toca.
@@ -2386,12 +2461,24 @@ ejecutar_atajos() {
     say "    ${RED}[FALLA]${NC} No pude escribir los atajos en ${home}.\n\n"
     return 1
   fi
-  activo="$(head -n 1 "${BENCH_DETECTADO}/sites/currentsite.txt" 2>/dev/null | tr -d '[:space:]' || true)"
+  # [v16.0.13] Mismo orden que _fa_sitio: 'bench use' guarda el sitio como
+  # default_site en common_site_config.json (Frappe 15/16), no en
+  # currentsite.txt. Leer sólo currentsite.txt daba "sin sitio activo".
+  local nsitios=0 sd
+  activo="$(grep -oP '"default_site"\s*:\s*"\K[^"]+' \
+    "${BENCH_DETECTADO}/sites/common_site_config.json" 2>/dev/null | head -n 1 || true)"
+  [[ -n "$activo" ]] || \
+    activo="$(head -n 1 "${BENCH_DETECTADO}/sites/currentsite.txt" 2>/dev/null | tr -d '[:space:]' || true)"
+  for sd in "${BENCH_DETECTADO}"/sites/*/; do
+    [[ -f "${sd}site_config.json" ]] && nsitios=$((nsitios + 1))
+  done
   say "    ${GREEN}[ OK ]${NC} Usuario ${USER_DETECTADO}  ·  bench ${BENCH_DETECTADO}\n"
   say "    ${GREEN}[ OK ]${NC} ~/.frappe-atajos.sh: ${ATAJOS_ARCHIVO}.\n"
   say "    ${GREEN}[ OK ]${NC} ~/.bashrc: bloque FRAPPE-ATAJOS ${ATAJOS_BLOQUE}.\n"
   if [[ -n "$activo" ]]; then
     say "    ${GREEN}[ OK ]${NC} Sitio activo: ${activo}\n\n"
+  elif (( nsitios == 1 )); then
+    say "    ${GREEN}[ OK ]${NC} Sitio activo: ${SITIO_DETECTADO} (el único del bench)\n\n"
   else
     say "    ${YELLOW}[AVISO]${NC} Sin sitio activo. Como ${USER_DETECTADO}: sitio ${SITIO_DETECTADO:-<nombre>}\n\n"
   fi
