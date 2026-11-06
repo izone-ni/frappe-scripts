@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v16.0.13
+#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v16.0.14
 #  https://github.com/izone-ni/frappe-scripts
 #  Despliegue automatizado + hardening de Frappe 15 y 16 / ERPNext
 #  Base: Ubuntu 24.04 LTS   Refs: CIS Ubuntu 24.04 v1.0.0, CIS NGINX v3.0.0
@@ -16,6 +16,22 @@
 #  El script detecta el entorno y se adapta. En un CT hay operaciones que el
 #  kernel del host NO delega al contenedor; se detallan en 'AJUSTES EN EL
 #  NODO PROXMOX' al final de esta cabecera.
+#
+#  CAMBIOS v16.0.14 (atajos para todos los comandos de bench):
+#   CAUSA: los atajos sólo cubrían los comandos del día a día; el resto
+#   había que escribirlo con 'b'. Y 'add app enlace rama' se leía raro.
+#
+#   [T8] Cada comando de bench 5.31 y de Frappe 16 tiene un atajo con su mismo
+#        nombre: 'set-admin-password X' = 'bench --site <sitio> set-admin-password X'.
+#        Sólo si el nombre está libre: si ya es un programa del sistema, un
+#        alias o una función (rm, find, install, pip...), no se toca y se
+#        llega al comando con 'b <nombre>'.
+#   [T9] Los que borran datos o cambian producción (drop-site, reinstall,
+#        restore, uninstall-app, update, 'setup production'...) piden
+#        confirmación: escribir el nombre del sitio, o 'si'.
+#   [T10] 'add' pasa a llamarse 'add-app <enlace> [rama]'.
+#   [T11] 'atajos' lista todos; 'atajos <texto>' filtra y dice qué ejecuta cada uno.
+#   ATAJOS_VERSION 3: '--atajos' reemplaza el archivo y deja copia .bak.
 #
 #  CAMBIOS v16.0.13 (atajos: el sitio activo no se encontraba):
 #   CAUSA: en Frappe 15 y 16, 'bench use' guarda el sitio como default_site
@@ -496,7 +512,7 @@ TIMEZONE="America/Managua"   # valor por defecto; la pregunta 6/10 lo cambia
 # la línea de inicio del log. Antes había tres valores distintos conviviendo
 # (v2.x en la cabecera, v1.0.0 en el banner) y era imposible saber, mirando
 # una captura de pantalla, qué versión había corrido de verdad.
-VERSION_SCRIPT="v16.0.13"
+VERSION_SCRIPT="v16.0.14"
 # ---------------------------------------------------------------------------
 #  MATRIZ DE COMPATIBILIDAD (verificada contra los repositorios de Frappe)
 #    campos: rama | python | node | mariadb | apps | SO compatibles
@@ -2006,7 +2022,7 @@ desinstalar() {
 #
 # Sube ATAJOS_VERSION cada vez que cambies el contenido: así se ve en la
 # primera línea del archivo instalado qué versión tiene cada servidor.
-ATAJOS_VERSION="2"
+ATAJOS_VERSION="3"
 
 atajos_contenido() {
   printf '# frappe-atajos v%s · generado por frappe-setup.sh\n' "$ATAJOS_VERSION"
@@ -2166,8 +2182,9 @@ _fa_enlace() {
   printf '%s\n' "$u"
 }
 
-# add <app> <enlace> [rama]. El orden da igual: se reconoce cuál es el enlace.
-add() {
+# add-app <enlace> [rama]. También acepta el nombre de la app en cualquier
+# posición (se reconoce cuál palabra es el enlace).
+add-app() {
   local t enlace="" antes=() despues=()
   for t in "$@"; do
     if [ -z "$enlace" ] && _fa_es_enlace "$t"; then enlace="$t"
@@ -2175,11 +2192,11 @@ add() {
     else despues+=("$t"); fi
   done
   if [ -z "$enlace" ]; then
-    _fa_uso "add <app> <enlace> [rama]    p. ej.: add mi_app github-izone-core:izone/mi_app version-15"
+    _fa_uso "add-app <enlace> [rama]    p. ej.: add-app github-izone-core:izone/mi_app version-15"
     return
   fi
   if [ $(( ${#antes[@]} + ${#despues[@]} )) -gt 2 ]; then
-    _fa_uso "add <app> <enlace> [rama]    (sobran palabras)"; return
+    _fa_uso "add-app <enlace> [rama]    (sobran palabras)"; return
   fi
   local app="" rama="" url
   if   [ ${#antes[@]} -eq 2 ];   then app="${antes[0]}";   rama="${antes[1]}"
@@ -2272,16 +2289,63 @@ sitio() {
   _fb use "$1" && export FRAPPE_SITE="$1" && echo "Sitio activo: $1"
 }
 
-# Comodín: cualquier comando de bench. Añade el sitio sólo a los que lo usan:
-# a un comando propio de bench, '--site' lo haría fallar.
+# --- Todos los comandos de bench ----------------------------------------------------
+# Comandos de bench 5.31 y de Frappe 16 (los de Frappe 15 son un subconjunto).
+# A un comando propio de bench, '--site' lo haría fallar: van sin sitio.
 _FA_SIN_SITIO=" app-cache backup-all-sites completions config disable-production download-translations drop exclude-app find get get-app include-app init install migrate-env new-app pip remote-reset-url remote-set-url remote-urls remove remove-app renew-lets-encrypt restart retry-upgrade rm set-mariadb-host set-nginx-port set-redis-cache-host set-redis-queue-host set-redis-socketio-host set-ssl-certificate set-ssl-key set-url-root setup socketio src start switch-to-branch switch-to-develop update validate-dependencies build create-patch create-rq-users drop-site list-sites make-app migrate-to new-site purge-jobs schedule setup-chrome use version watch worker worker-pool "
+# Comandos de Frappe que actúan sobre un sitio.
+_FA_CON_SITIO=" add-database-index add-system-manager add-to-email-queue add-to-hosts add-user backup browse build-message-files build-search-index bulk-rename bypass-patch clear-cache clear-log-table clear-website-cache console convert-sidebar-fixtures data-import db-console describe-database-table destroy-all-sessions disable-scheduler disable-user doctor enable-scheduler execute export-csv export-doc export-fixtures export-json get-untranslated import-doc import-translations install-app jupyter list-apps mariadb migrate migrate-translations new-language ngrok partial-restore postgres publish-realtime ready-for-migration rebuild-global-search reinstall reload-doc reload-doctype remove-from-installed-apps request reset-perms restore run-parallel-tests run-patch run-tests run-ui-tests scheduler serve set-admin-password set-config set-last-active-for-user set-maintenance-mode set-password show-config show-pending-jobs sqlite start-recording stop-recording sync-desktop-icons transform-database trigger-scheduler-event trim-database trim-tables uninstall-app update-translations "
+# Borran datos, desmontan producción o la cambian de rama: piden confirmación.
+_FA_PELIGRO=" drop-site reinstall restore partial-restore trim-database trim-tables uninstall-app remove-from-installed-apps transform-database clear-log-table purge-jobs destroy-all-sessions reset-perms bulk-rename migrate-to drop update start remove-app disable-production switch-to-branch switch-to-develop migrate-env "
+# Subcomandos de 'setup' que cambian producción o el acceso al servidor.
+_FA_SETUP_PELIGRO=" production ssh-port firewall fail2ban sudoers role "
+# Sin atajo propio aunque estén libres: alias de otros (get, remove, rm),
+# instaladores del sistema (install, init) o nombres que confunden (pip, find).
+_FA_NO_AUTO=" get remove rm install init pip find watch mariadb "
+
+_fa_confirmar() {   # _fa_confirmar <mensaje> <palabra>
+  local r
+  printf '\033[1;33m!\033[0m %s\n' "$1" >&2
+  read -r -p "  Escribe «$2» para continuar (otra cosa cancela): " r
+  [ "$r" = "$2" ] && return 0
+  echo "  Cancelado: no se ejecutó nada." >&2
+  return 1
+}
+
+# _fa_cmd <comando> [args]: ejecuta un comando de bench con o sin sitio según
+# corresponda, y con confirmación si es peligroso. Lo usan 'b' y los atajos
+# automáticos. En los de sitio, un sitio como primer argumento vale sólo esa vez.
+_fa_cmd() {
+  local c="$1" obj
+  case "$_FA_PELIGRO" in
+    *" $c "*)
+      if [ "$c" = drop-site ] && [ -n "${2:-}" ]; then
+        _fa_confirmar "«drop-site» borra el sitio $2: base de datos y archivos." "$2" || return 1
+      else
+        case "$_FA_SIN_SITIO" in
+          *" $c "*) _fa_confirmar "«$c» afecta a todo el bench y a producción." "si" || return 1 ;;
+          *) if _fa_es_sitio "${2:-}"; then obj="$2"; else obj="$(_fa_sitio)" || return 1; fi
+             _fa_confirmar "«$c» puede borrar datos del sitio $obj." "$obj" || return 1 ;;
+        esac
+      fi ;;
+  esac
+  if [ "$c" = setup ]; then
+    case "$_FA_SETUP_PELIGRO" in
+      *" ${2:-} "*) _fa_confirmar "«setup ${2:-}» cambia producción o el acceso al servidor." "si" || return 1 ;;
+    esac
+  fi
+  case "$_FA_SIN_SITIO" in
+    *" $c "*) _fb "$@" ;;
+    *) shift; _fsx "$c" "$@" ;;
+  esac
+}
+
+# Comodín: cualquier comando, también los que chocan con un programa del
+# sistema (b find, b pip) o si quieres pasar opciones de bench (b --version).
 b() {
   [ $# -gt 0 ] || { _fa_uso "b <comando> [argumentos]    p. ej.: b set-admin-password"; return; }
   case "$1" in -*) _fb "$@"; return ;; esac
-  case "$_FA_SIN_SITIO" in
-    *" $1 "*) _fb "$@" ;;
-    *)        _fs "$@" ;;
-  esac
+  _fa_cmd "$@"
 }
 
 # --- Llaves SSH ------------------------------------------------------------------
@@ -2349,13 +2413,14 @@ llaves() {
   done
   echo
   echo "Prueba:  ssh -T git@${hechas[0]%%|*}"
-  echo "Usa:     add mi_app ${hechas[0]%%|*}:org/repo version-15"
+  echo "Usa:     add-app ${hechas[0]%%|*}:org/repo version-15"
   echo "Con contraseña, git la pide en cada descarga. 'ssh-add ${hechas[0]#*|}' la recuerda en esta sesión."
 }
 
 # --- Ayuda -------------------------------------------------------------------------
 atajos() {
   local s
+  if [ -n "${1:-}" ]; then _fa_atajos_filtro "$1"; return; fi
   s="$(_fa_sitio 2>/dev/null)" || s="(ninguno: usa 'sitio <nombre>')"
   printf '\nAtajos de bench   bench: %s   sitio: %s\n\n' "$FRAPPE_BENCH" "$s"
   printf '  %-34s %s\n' \
@@ -2373,7 +2438,7 @@ atajos() {
     "scheduler on|off|status [sitio]" "scheduler enable|disable|status" \
     "fwatch"                         "bench watch" \
     "" "" \
-    "add <app> <enlace> [rama]"      "bench get-app --branch <rama> <enlace>" \
+    "add-app <enlace> [rama]"        "bench get-app --branch <rama> <enlace>" \
     "install-app [sitio] <app>"      "bench --site <sitio> install-app <app>" \
     "llaves [cantidad]"              "llaves SSH con contraseña + ~/.ssh/config" \
     "" "" \
@@ -2382,9 +2447,72 @@ atajos() {
     "estado"                         "supervisorctl status + doctor" \
     "sitio [nombre]"                 "ver o cambiar el sitio activo" \
     "bcd"                            "cd al bench" \
-    "b <comando>"                    "cualquier otro comando de bench"
-  printf '\n  Sin [sitio] se usa el activo. bench sigue funcionando igual.\n\n'
+    "b <comando>"                    "cualquier comando, aunque su nombre esté ocupado"
+  printf '\n  Además, cada comando de bench con su mismo nombre (%d):\n' "${#_FA_AUTO[@]}"
+  printf '  set-admin-password X  =  bench --site <sitio> set-admin-password X\n'
+  printf '  Los de sitio aceptan otro como primer argumento. (!) pide confirmación.\n\n'
+  _fa_columnas "${_FA_AUTO[@]}"
+  if [ ${#_FA_OCUPADOS[@]} -gt 0 ]; then
+    printf '\n  Su nombre ya es un programa del sistema; úsalos con b <nombre>:\n\n'
+    _fa_columnas "${_FA_OCUPADOS[@]}"
+  fi
+  printf '\n  Sin [sitio] se usa el activo. Filtra la lista con: atajos <texto>\n'
+  printf '  bench sigue funcionando igual.\n\n'
 }
+
+# Nombres en columnas, con (!) en los que piden confirmación.
+_fa_columnas() {
+  local n
+  for n in "$@"; do
+    case "$_FA_PELIGRO" in *" $n "*) printf '%s (!)\n' "$n" ;; *) printf '%s\n' "$n" ;; esac
+  done | if command -v column >/dev/null 2>&1; then
+    column -c "$(( ${COLUMNS:-100} - 2 ))" | expand | sed 's/^/  /'
+  else
+    sed 's/^/  /'
+  fi
+}
+
+# 'atajos <texto>': sólo los comandos cuyo nombre contiene ese texto.
+_FA_PROPIOS=" migrate build restart clear-cache console fdb list-apps version backup doctor maint scheduler fwatch add-app install-app llaves deploy logs estado sitio bcd b atajos "
+_fa_atajos_filtro() {
+  local n hay=0
+  for n in $_FA_PROPIOS; do
+    case "$n" in *"$1"*) hay=1; printf '  %-28s atajo propio (la tabla de: atajos)\n' "$n" ;; esac
+  done
+  for n in "${_FA_AUTO[@]}" "${_FA_OCUPADOS[@]}"; do
+    case "$n" in *"$1"*) ;; *) continue ;; esac
+    hay=1
+    case " ${_FA_OCUPADOS[*]} " in
+      *" $n "*) printf '  %-28s b %s   (el nombre es un programa del sistema)\n' "$n" "$n" ;;
+      *) case "$_FA_SIN_SITIO" in
+           *" $n "*) printf '  %-28s bench %s' "$n" "$n" ;;
+           *)        printf '  %-28s bench --site <sitio> %s' "$n" "$n" ;;
+         esac
+         case "$_FA_PELIGRO" in *" $n "*) printf '   (!) pide confirmación' ;; esac
+         printf '\n' ;;
+    esac
+  done
+  [ "$hay" -eq 1 ] || echo "  Ningún comando contiene «$1»."
+}
+
+# --- Un atajo por cada comando de bench -------------------------------------------
+# Con el mismo nombre, para todo comando que no tenga ya un atajo propio. Si el
+# nombre ya existe (un programa del sistema, un alias o una función tuya), no
+# se toca: se llega al comando con 'b <nombre>'. Al recargar ~/.bashrc se
+# rehacen desde cero, así que la lista siempre refleja el estado real.
+for _fa_n in ${_FA_AUTO[@]+"${_FA_AUTO[@]}"}; do unset -f "$_fa_n"; done
+_FA_AUTO=(); _FA_OCUPADOS=()
+for _fa_n in $_FA_SIN_SITIO $_FA_CON_SITIO; do
+  case "$_FA_NO_AUTO" in *" $_fa_n "*) continue ;; esac
+  if type -t "$_fa_n" >/dev/null 2>&1; then
+    declare -F "$_fa_n" >/dev/null 2>&1 || _FA_OCUPADOS+=("$_fa_n")
+    continue
+  fi
+  eval "${_fa_n}() { _fa_cmd ${_fa_n} \"\$@\"; }"
+  _FA_AUTO+=("$_fa_n")
+done
+[ ${#_FA_AUTO[@]} -gt 0 ] && mapfile -t _FA_AUTO < <(printf '%s\n' "${_FA_AUTO[@]}" | LC_ALL=C sort)
+unset _fa_n
 
 # Atajos propios, que frappe-setup.sh nunca toca.
 # shellcheck source=/dev/null
@@ -2485,7 +2613,8 @@ ejecutar_atajos() {
   say "  Se activan en la próxima sesión de ${USER_DETECTADO}, o ya mismo con: ${BOLD}source ~/.bashrc${NC}\n"
   say "  Escribe ${BOLD}atajos${NC} para ver la lista. bench sigue funcionando igual.\n\n"
   say "    migrate · build · restart · clear-cache · console · install-app <app>\n"
-  say "    add <app> <enlace> [rama] · deploy · logs · sitio · llaves · b <comando>\n\n"
+  say "    add-app <enlace> [rama] · deploy · logs · sitio · llaves · b <comando>\n"
+  say "    y cada comando de bench con su mismo nombre: set-admin-password, run-patch...\n\n"
   return 0
 }
 
