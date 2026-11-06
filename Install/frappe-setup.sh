@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v16.0.11
+#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v16.0.12
 #  https://github.com/izone-ni/frappe-scripts
 #  Despliegue automatizado + hardening de Frappe 15 y 16 / ERPNext
 #  Base: Ubuntu 24.04 LTS   Refs: CIS Ubuntu 24.04 v1.0.0, CIS NGINX v3.0.0
@@ -10,11 +10,37 @@
 #     bash bashcore-frappe16-v2.sh              # instalación / reanudación
 #     bash bashcore-frappe16-v2.sh --status     # ver qué pasos van completados
 #     bash bashcore-frappe16-v2.sh --reset      # olvidar el progreso y empezar
+#     bash bashcore-frappe16-v2.sh --atajos     # comandos cortos para bench
 #
 #  ENTORNO: VM, hardware físico o CONTENEDOR LXC de Proxmox (CT).
 #  El script detecta el entorno y se adapta. En un CT hay operaciones que el
 #  kernel del host NO delega al contenedor; se detallan en 'AJUSTES EN EL
 #  NODO PROXMOX' al final de esta cabecera.
+#
+#  CAMBIOS v16.0.12 (atajos de bench):
+#   CAUSA: cada comando de bench obliga a entrar en el bench y a repetir el
+#   sitio: 'cd ~/frappe-bench && bench --site izone.frappe.software migrate'.
+#   Se escribe decenas de veces al día.
+#
+#   REGLA: sólo se AÑADEN líneas. De lo existente cambian tres cosas: en el
+#   menú principal la opción 5 pasa a ser Atajos y Salir pasa al 6 (también
+#   como respuesta por defecto), la desinstalación borra además los atajos y
+#   el resumen final los menciona. bench sigue funcionando exactamente igual:
+#   los atajos son funciones con nombres propios, no lo sustituyen.
+#
+#   [T1] ~/.frappe-atajos.sh: migrate, build, restart, clear-cache, console,
+#        fdb, list-apps, version, backup, doctor, maint, scheduler, fwatch,
+#        add, install-app, deploy, logs, estado, sitio, bcd, llaves, atajos
+#        y el comodín 'b' para cualquier otro comando de bench.
+#   [T2] El sitio sale de FRAPPE_SITE o, si está vacía, de
+#        sites/currentsite.txt, que escribe 'bench use'. 'sitio <nombre>' lo
+#        cambia también para las sesiones siguientes.
+#   [T3] Se instalan al final del despliegue, con '--atajos' o con la opción
+#        5 del menú. Idempotente: si ya están, no se duplica nada; si cambió
+#        su contenido, se reemplaza y queda copia en ~/.frappe-atajos.sh.bak.
+#   [T4] 'llaves' crea N llaves ed25519, cada una con su contraseña (la pide
+#        ssh-keygen; nunca pasa por -N, que la dejaría visible en 'ps'), y su
+#        bloque Host en ~/.ssh/config sin duplicar los que ya existen.
 #
 #  CAMBIOS v16.0.11 (arm64: Raspberry Pi con Ubuntu 26.04):
 #   CAUSA: hacía falta instalar Frappe 16 en arm64 (Raspberry Pi 5, Ubuntu
@@ -456,7 +482,7 @@ TIMEZONE="America/Managua"   # valor por defecto; la pregunta 6/10 lo cambia
 # la línea de inicio del log. Antes había tres valores distintos conviviendo
 # (v2.x en la cabecera, v1.0.0 en el banner) y era imposible saber, mirando
 # una captura de pantalla, qué versión había corrido de verdad.
-VERSION_SCRIPT="v16.0.11"
+VERSION_SCRIPT="v16.0.12"
 # ---------------------------------------------------------------------------
 #  MATRIZ DE COMPATIBILIDAD (verificada contra los repositorios de Frappe)
 #    campos: rama | python | node | mariadb | apps | SO compatibles
@@ -1405,6 +1431,7 @@ while (( $# > 0 )); do
     --python-version) shift; PYTHON_VERSION="${1:-3.14}" ;;
     --attach) ACTION="attach" ;;
     --reset)  ACTION="reset"  ;;
+    --atajos) ACTION="atajos" ;;
     -h|--help)
       cat <<AYUDA
 bashcore-frappe  ${VERSION_SCRIPT}
@@ -1420,6 +1447,9 @@ bashcore-frappe  ${VERSION_SCRIPT}
   --python-version X.Y  Fuerza la versión de Python (por defecto 3.14).
   --attach           Se reengancha a la consola de la instalación en curso.
   --reset            Borra el progreso (NO desinstala nada).
+  --atajos           Añade comandos cortos para bench al usuario del bench:
+                     'migrate' en vez de 'bench --site <sitio> migrate'.
+                     Si ya están, no los duplica. bench sigue igual.
   -h, --help         Esta ayuda.
 
 Variables de entorno (pruebas):
@@ -1901,6 +1931,10 @@ desinstalar() {
            "${HOMEBASE}/${USER_DETECTADO}/.local/bin/bench" \
            "${HOMEBASE}/${USER_DETECTADO}/.cache/yarn" 2>/dev/null || true
     sed -i '/BASHCORE-ENV/,/\/BASHCORE-ENV/d' "${HOMEBASE}/${USER_DETECTADO}/.bashrc" 2>/dev/null || true
+    # [T3] Los atajos de bench. El .local.sh es del usuario: se conserva.
+    sed -i '/FRAPPE-ATAJOS/,/\/FRAPPE-ATAJOS/d' "${HOMEBASE}/${USER_DETECTADO}/.bashrc" 2>/dev/null || true
+    rm -f "${HOMEBASE}/${USER_DETECTADO}/.frappe-atajos.sh" \
+          "${HOMEBASE}/${USER_DETECTADO}/.frappe-atajos.sh.bak" 2>/dev/null || true
   fi
   rm -f /usr/local/bin/bench /usr/local/bin/node /usr/bin/node \
         /usr/local/bin/npm /usr/local/bin/yarn 2>/dev/null || true
@@ -1941,6 +1975,430 @@ desinstalar() {
   say "\n  ${GREEN}${BOLD}Desinstalación terminada.${NC}\n"
   say "  El sistema queda como antes del despliegue.\n"
   say "  ${YELLOW}Recuerda:${NC} SSH ha vuelto al puerto 22.\n\n"
+  return 0
+}
+
+# =============================================================================
+#  ATAJOS DE BENCH
+# =============================================================================
+# [T1] Comandos cortos para el usuario del bench: 'migrate' en lugar de
+# 'cd ~/frappe-bench && bench --site <sitio> migrate'. Son funciones de bash
+# con nombres propios: bench NO se toca y sigue funcionando igual.
+#
+# Dos piezas en el home del usuario:
+#   ~/.frappe-atajos.sh    las funciones (lo genera atajos_contenido)
+#   ~/.bashrc              un bloque FRAPPE-ATAJOS que lo carga
+# Las dos se escriben una sola vez: volver a instalar no duplica nada.
+#
+# Sube ATAJOS_VERSION cada vez que cambies el contenido: así se ve en la
+# primera línea del archivo instalado qué versión tiene cada servidor.
+ATAJOS_VERSION="1"
+
+atajos_contenido() {
+  printf '# frappe-atajos v%s · generado por frappe-setup.sh\n' "$ATAJOS_VERSION"
+  cat <<'FRAPPE_ATAJOS_EOF'
+# =============================================================================
+#  Atajos de bench. Escribe 'atajos' para ver la lista.
+#
+#  frappe-setup.sh reemplaza este archivo cuando cambia: tus atajos propios
+#  van en ~/.frappe-atajos.local.sh, que se carga al final.
+#  Nada de esto sustituye a bench: 'bench --site <sitio> migrate' sigue igual.
+#  Si un atajo tapa un programa del sistema, llega a él con: command <nombre>
+# =============================================================================
+
+# Sólo bash interactivo: Supervisor, cron y los scripts no ven estos nombres.
+[ -n "${BASH_VERSION:-}" ] || return 0
+case $- in *i*) ;; *) return 0 ;; esac
+
+: "${FRAPPE_BENCH:=$HOME/frappe-bench}"
+
+# --- Base ----------------------------------------------------------------------
+# El sitio activo: FRAPPE_SITE si está puesta; si no, el que fijó 'bench use'.
+_fa_sitio() {
+  if [ -n "${FRAPPE_SITE:-}" ]; then printf '%s\n' "$FRAPPE_SITE"; return 0; fi
+  if [ -s "$FRAPPE_BENCH/sites/currentsite.txt" ]; then
+    head -n 1 "$FRAPPE_BENCH/sites/currentsite.txt" | tr -d '[:space:]'; echo
+    return 0
+  fi
+  echo "No hay sitio activo. Fíjalo con: sitio <nombre>" >&2
+  return 1
+}
+
+# bench dentro del bench, en un subshell: nunca te cambia de carpeta.
+_fb() {
+  if [ ! -d "$FRAPPE_BENCH" ]; then
+    echo "No encuentro el bench en $FRAPPE_BENCH" >&2; return 1
+  fi
+  ( cd "$FRAPPE_BENCH" && command bench "$@" )
+}
+
+# Igual que _fb, con el sitio activo.
+_fs() {
+  local s
+  s="$(_fa_sitio)" || return 1
+  _fb --site "$s" "$@"
+}
+
+_fa_paso() { printf '\033[1;36m>\033[0m %s\n' "$*"; }
+_fa_uso()  { printf 'Uso: %s\n' "$*" >&2; return 2; }
+
+# --- Día a día -------------------------------------------------------------------
+migrate()     { _fs migrate "$@"; }
+restart()     { _fb restart "$@"; }
+console()     { _fs console "$@"; }
+fdb()         { _fs mariadb "$@"; }        # 'mariadb' ya es el cliente del sistema
+list-apps()   { _fs list-apps "$@"; }
+version()     { _fb version "$@"; }
+backup()      { _fs backup --with-files "$@"; }
+doctor()      { _fs doctor "$@"; }
+fwatch()      { _fb watch "$@"; }          # 'watch' ya es un programa de Ubuntu
+clear-cache() { _fs clear-cache && _fs clear-website-cache; }
+
+# build compila para todo el bench: no lleva sitio. 'build hrms' sólo esa app.
+build() {
+  case "${1:-}" in
+    ''|-*) _fb build "$@" ;;
+    *) local app="$1"; shift; _fb build --app "$app" "$@" ;;
+  esac
+}
+
+maint() {
+  case "${1:-}" in
+    on|off) _fs set-maintenance-mode "$1" ;;
+    *) _fa_uso "maint on|off" ;;
+  esac
+}
+
+scheduler() {
+  case "${1:-}" in
+    on)  _fs scheduler enable ;;
+    off) _fs scheduler disable ;;
+    status|pause|resume) _fs scheduler "$1" ;;
+    *) _fa_uso "scheduler on|off|status" ;;
+  esac
+}
+
+# --- Apps ------------------------------------------------------------------------
+install-app() {
+  [ $# -gt 0 ] || { _fa_uso "install-app <app> [app...]"; return; }
+  _fs install-app "$@"
+}
+
+# ¿Es un enlace? URL, ruta local o el atajo de una llave (github-x:org/repo).
+_fa_es_enlace() {
+  case "$1" in
+    http://*|https://*|git@*|ssh://*|/*|./*) return 0 ;;
+  esac
+  [[ "$1" =~ ^[A-Za-z0-9._-]+:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]
+}
+
+# github-izone-core:izone/mi_app  ->  git@github-izone-core:izone/mi_app.git
+_fa_enlace() {
+  case "$1" in
+    http://*|https://*|git@*|ssh://*|/*|./*) printf '%s\n' "$1"; return 0 ;;
+  esac
+  local u="git@$1"
+  [[ "$u" == *.git ]] || u="$u.git"
+  printf '%s\n' "$u"
+}
+
+# add <app> <enlace> [rama]. El orden da igual: se reconoce cuál es el enlace.
+add() {
+  local t enlace="" antes=() despues=()
+  for t in "$@"; do
+    if [ -z "$enlace" ] && _fa_es_enlace "$t"; then enlace="$t"
+    elif [ -z "$enlace" ]; then antes+=("$t")
+    else despues+=("$t"); fi
+  done
+  if [ -z "$enlace" ]; then
+    _fa_uso "add <app> <enlace> [rama]    p. ej.: add mi_app github-izone-core:izone/mi_app version-15"
+    return
+  fi
+  if [ $(( ${#antes[@]} + ${#despues[@]} )) -gt 2 ]; then
+    _fa_uso "add <app> <enlace> [rama]    (sobran palabras)"; return
+  fi
+  local app="" rama="" url
+  if   [ ${#antes[@]} -eq 2 ];   then app="${antes[0]}";   rama="${antes[1]}"
+  elif [ ${#antes[@]} -eq 1 ];   then app="${antes[0]}";   rama="${despues[0]:-}"
+  elif [ ${#despues[@]} -eq 2 ]; then app="${despues[0]}"; rama="${despues[1]}"
+  else rama="${despues[0]:-}"; fi
+  url="$(_fa_enlace "$enlace")"
+  if [ -z "$app" ]; then app="${url##*/}"; app="${app##*:}"; app="${app%.git}"; fi
+  if [ -n "$rama" ]; then
+    _fa_paso "bench get-app --branch $rama $url"
+    _fb get-app --branch "$rama" "$url" || return
+  else
+    _fa_paso "bench get-app $url"
+    _fb get-app "$url" || return
+  fi
+  if [ -d "$FRAPPE_BENCH/apps/$app" ]; then
+    echo "Para instalarla en el sitio:  install-app $app"
+  else
+    echo "Descargada. Mira su nombre con 'ls $FRAPPE_BENCH/apps' e instálala con: install-app <nombre>"
+  fi
+}
+
+# --- Combinaciones -----------------------------------------------------------------
+_fa_deploy_fallo() {
+  printf '\033[1;31mX\033[0m Falló «%s». El sitio sigue en modo mantenimiento.\n' "$1" >&2
+  echo "  Corrige el error y vuelve a ejecutar deploy, o quítalo con: maint off" >&2
+}
+
+# Lo de siempre después de actualizar una app. Se detiene en el primer fallo
+# y deja el mantenimiento puesto: nadie entra a un sitio a medio migrar.
+deploy() {
+  _fa_sitio >/dev/null || return 1
+  _fa_paso "1/6 mantenimiento on"
+  _fs set-maintenance-mode on || { echo "No se pudo activar el mantenimiento: no hice nada más." >&2; return 1; }
+  _fa_paso "2/6 migrate";     _fs migrate  || { _fa_deploy_fallo migrate; return 1; }
+  _fa_paso "3/6 build";       _fb build    || { _fa_deploy_fallo build; return 1; }
+  _fa_paso "4/6 clear-cache"; clear-cache  || { _fa_deploy_fallo clear-cache; return 1; }
+  _fa_paso "5/6 restart";     _fb restart  || { _fa_deploy_fallo restart; return 1; }
+  _fa_paso "6/6 mantenimiento off"
+  _fs set-maintenance-mode off || { echo "Todo aplicado, pero el mantenimiento sigue puesto. Quítalo con: maint off" >&2; return 1; }
+  echo "deploy terminado."
+}
+
+logs() {
+  local f
+  case "${1:-worker}" in
+    web)       f=web.error.log ;;
+    worker)    f=worker.error.log ;;
+    scheduler) f=schedule.error.log ;;
+    socketio)  f=node-socketio.error.log ;;
+    *) _fa_uso "logs [web|worker|scheduler|socketio]"; return ;;
+  esac
+  tail -n 50 -F "$FRAPPE_BENCH/logs/$f"
+}
+
+estado() {
+  supervisorctl status
+  _fs doctor
+}
+
+# --- Navegación ------------------------------------------------------------------
+bcd() { cd "$FRAPPE_BENCH" || return; }   # el único que sí te cambia de carpeta
+
+# Sin nombre: muestra el sitio activo y los que hay. Con nombre: lo cambia.
+sitio() {
+  local s d
+  if [ -z "${1:-}" ]; then
+    s="$(_fa_sitio 2>/dev/null)" || s="(ninguno)"
+    echo "Sitio activo: $s"
+    echo "Sitios del bench:"
+    for d in "$FRAPPE_BENCH"/sites/*/; do
+      [ -f "${d}site_config.json" ] && echo "  $(basename "$d")"
+    done
+    return 0
+  fi
+  if [ ! -f "$FRAPPE_BENCH/sites/$1/site_config.json" ]; then
+    echo "No existe el sitio «$1» en $FRAPPE_BENCH/sites" >&2; return 1
+  fi
+  _fb use "$1" && export FRAPPE_SITE="$1" && echo "Sitio activo: $1"
+}
+
+# Comodín: cualquier comando de bench. Añade el sitio sólo a los que lo usan:
+# a un comando propio de bench, '--site' lo haría fallar.
+_FA_SIN_SITIO=" app-cache backup-all-sites completions config disable-production download-translations drop exclude-app find get get-app include-app init install migrate-env new-app pip remote-reset-url remote-set-url remote-urls remove remove-app renew-lets-encrypt restart retry-upgrade rm set-mariadb-host set-nginx-port set-redis-cache-host set-redis-queue-host set-redis-socketio-host set-ssl-certificate set-ssl-key set-url-root setup socketio src start switch-to-branch switch-to-develop update validate-dependencies build create-patch create-rq-users drop-site list-sites make-app migrate-to new-site purge-jobs schedule setup-chrome use version watch worker worker-pool "
+b() {
+  [ $# -gt 0 ] || { _fa_uso "b <comando> [argumentos]    p. ej.: b set-admin-password"; return; }
+  case "$1" in -*) _fb "$@"; return ;; esac
+  case "$_FA_SIN_SITIO" in
+    *" $1 "*) _fb "$@" ;;
+    *)        _fs "$@" ;;
+  esac
+}
+
+# --- Llaves SSH ------------------------------------------------------------------
+# Crea N llaves ed25519, cada una con su contraseña, y su bloque Host en
+# ~/.ssh/config. La contraseña la pide ssh-keygen sin mostrarla: nunca pasa
+# por -N, que la dejaría visible en 'ps'. Nada existente se sobrescribe.
+_fa_host_existe() {
+  awk -v h="$1" 'tolower($1)=="host" { for (i=2; i<=NF; i++) if ($i==h) f=1 } END { exit !f }' "$2"
+}
+
+llaves() {
+  local n="${1:-}" i nombre host desc f cfg="$HOME/.ssh/config" x
+  local hechas=()
+  command -v ssh-keygen >/dev/null 2>&1 || { echo "Falta ssh-keygen (paquete openssh-client)." >&2; return 1; }
+  # Sin terminal, ssh-keygen no puede pedir la contraseña y crearía la llave
+  # SIN ella, en silencio. Mejor no crear nada.
+  if ! { : > /dev/tty; } 2>/dev/null; then
+    echo "llaves necesita una terminal para pedir las contraseñas." >&2; return 1
+  fi
+  [ -n "$n" ] || read -r -p "¿Cuántas llaves quieres crear? " n
+  if ! [[ "$n" =~ ^[1-9][0-9]?$ ]]; then echo "Escribe un número entre 1 y 99." >&2; return 2; fi
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+  [ -f "$cfg" ] || : > "$cfg"
+  chmod 600 "$cfg"
+  for (( i = 1; i <= n; i++ )); do
+    printf '\n[%d/%d]\n' "$i" "$n"
+    while :; do
+      read -r -p "  Nombre de la llave (p. ej. core): " nombre
+      [[ "$nombre" =~ ^[A-Za-z0-9_-]+$ ]] && break
+      echo "  Sólo letras, números, guion y guion bajo."
+    done
+    while :; do
+      read -r -p "  Alias del Host [github-$nombre]: " host
+      host="${host:-github-$nombre}"
+      [[ "$host" =~ ^[A-Za-z0-9._-]+$ ]] && break
+      echo "  Sin espacios: letras, números, punto, guion y guion bajo."
+    done
+    read -r -p "  Descripción [Repositorio / Cuenta $i]: " desc
+    desc="${desc:-Repositorio / Cuenta $i}"
+    f="$HOME/.ssh/id_ed25519_$nombre"
+    if [ -e "$f" ]; then
+      echo "  - La llave $f ya existe: la conservo."
+    else
+      echo "  Contraseña de la llave (no se muestra; Enter = sin contraseña):"
+      if ! ssh-keygen -q -t ed25519 -f "$f" -C "$host"; then
+        echo "  X ssh-keygen falló: sigo con la siguiente." >&2; continue
+      fi
+      echo "  + Llave creada: $f"
+    fi
+    if _fa_host_existe "$host" "$cfg"; then
+      echo "  - El Host $host ya estaba en ~/.ssh/config: no lo duplico."
+    else
+      printf '\n# %s\nHost %s\n    HostName github.com\n    User git\n    IdentityFile ~/.ssh/id_ed25519_%s\n    IdentitiesOnly yes\n' \
+        "$desc" "$host" "$nombre" >> "$cfg"
+      echo "  + Host $host añadido a ~/.ssh/config"
+    fi
+    hechas+=("$host|$f")
+  done
+  [ ${#hechas[@]} -gt 0 ] || return 1
+  echo
+  echo "Pega cada llave pública en GitHub: Settings > Deploy keys del repositorio,"
+  echo "o SSH keys de la cuenta."
+  for x in "${hechas[@]}"; do
+    printf '\n  %s\n  ' "${x%%|*}"; cat "${x#*|}.pub"
+  done
+  echo
+  echo "Prueba:  ssh -T git@${hechas[0]%%|*}"
+  echo "Usa:     add mi_app ${hechas[0]%%|*}:org/repo version-15"
+  echo "Con contraseña, git la pide en cada descarga. 'ssh-add ${hechas[0]#*|}' la recuerda en esta sesión."
+}
+
+# --- Ayuda -------------------------------------------------------------------------
+atajos() {
+  local s
+  s="$(_fa_sitio 2>/dev/null)" || s="(ninguno: usa 'sitio <nombre>')"
+  printf '\nAtajos de bench   bench: %s   sitio: %s\n\n' "$FRAPPE_BENCH" "$s"
+  printf '  %-30s %s\n' \
+    "migrate"                    "bench --site <sitio> migrate" \
+    "build [app]"                "bench build [--app <app>]" \
+    "restart"                    "bench restart" \
+    "clear-cache"                "clear-cache + clear-website-cache" \
+    "console"                    "bench --site <sitio> console" \
+    "fdb"                        "bench --site <sitio> mariadb" \
+    "list-apps"                  "bench --site <sitio> list-apps" \
+    "version"                    "bench version" \
+    "backup"                     "bench --site <sitio> backup --with-files" \
+    "doctor"                     "bench --site <sitio> doctor" \
+    "maint on|off"               "set-maintenance-mode on|off" \
+    "scheduler on|off|status"    "scheduler enable|disable|status" \
+    "fwatch"                     "bench watch" \
+    "" "" \
+    "add <app> <enlace> [rama]"  "bench get-app --branch <rama> <enlace>" \
+    "install-app <app>"          "bench --site <sitio> install-app <app>" \
+    "llaves [cantidad]"          "llaves SSH con contraseña + ~/.ssh/config" \
+    "" "" \
+    "deploy"                     "mantenimiento, migrate, build, caché, restart" \
+    "logs [web|worker|...]"      "tail -F logs/<proceso>.error.log" \
+    "estado"                     "supervisorctl status + doctor" \
+    "sitio [nombre]"             "ver o cambiar el sitio activo" \
+    "bcd"                        "cd al bench" \
+    "b <comando>"                "cualquier otro comando de bench"
+  printf '\n  bench sigue funcionando igual.\n\n'
+}
+
+# Atajos propios, que frappe-setup.sh nunca toca.
+# shellcheck source=/dev/null
+[ -f "$HOME/.frappe-atajos.local.sh" ] && . "$HOME/.frappe-atajos.local.sh"
+:
+FRAPPE_ATAJOS_EOF
+}
+
+# instalar_atajos <usuario> <home>
+# Escribe ~/.frappe-atajos.sh y el bloque de ~/.bashrc. Idempotente. No usa
+# say ni ok: quien la llama decide dónde informar, con ATAJOS_ARCHIVO y
+# ATAJOS_BLOQUE. Llámala SIEMPRE dentro de un 'if': un fallo aquí nunca debe
+# disparar el trap ERR ni detener un despliegue que ya funciona.
+instalar_atajos() {
+  local u="$1" home="$2" tmp dest rc
+  ATAJOS_ARCHIVO=""; ATAJOS_BLOQUE=""
+  [[ -n "$u" && -n "$home" && -d "$home" ]] || return 1
+  dest="${home}/.frappe-atajos.sh"
+  rc="${home}/.bashrc"
+
+  tmp="$(mktemp)" || return 1
+  if ! atajos_contenido > "$tmp"; then rm -f "$tmp"; return 1; fi
+  if [[ -f "$dest" ]] && cmp -s "$tmp" "$dest"; then
+    ATAJOS_ARCHIVO="ya estaban al día"
+  else
+    if [[ -f "$dest" ]]; then
+      cp -p "$dest" "${dest}.bak" || { rm -f "$tmp"; return 1; }
+      ATAJOS_ARCHIVO="actualizados (la versión anterior queda en ~/.frappe-atajos.sh.bak)"
+    else
+      ATAJOS_ARCHIVO="instalados"
+    fi
+    if ! cp "$tmp" "$dest"; then rm -f "$tmp"; return 1; fi
+    chmod 644 "$dest"
+    chown "${u}:" "$dest" 2>/dev/null || true
+  fi
+  rm -f "$tmp"
+
+  if grep -q 'FRAPPE-ATAJOS' "$rc" 2>/dev/null; then
+    ATAJOS_BLOQUE="ya estaba"
+  else
+    if [[ ! -f "$rc" ]]; then
+      : > "$rc" || return 1
+      chown "${u}:" "$rc" 2>/dev/null || true
+    fi
+    cat >> "$rc" <<'FRAPPE_ATAJOS_RC' || return 1
+
+# --- FRAPPE-ATAJOS (escribe 'atajos' para ver la lista) ---
+export FRAPPE_BENCH="$HOME/frappe-bench"
+# export FRAPPE_SITE="mi.sitio"   # opcional; si no, se usa el de 'bench use'
+[ -f "$HOME/.frappe-atajos.sh" ] && . "$HOME/.frappe-atajos.sh"
+# --- /FRAPPE-ATAJOS ---
+FRAPPE_ATAJOS_RC
+    ATAJOS_BLOQUE="añadido"
+  fi
+  return 0
+}
+
+# Versión interactiva, para '--atajos' y la opción 5 del menú.
+ejecutar_atajos() {
+  say "\n${BOLD}  ATAJOS DE BENCH${NC}\n\n"
+  if ! detectar_instalacion; then
+    say "    ${RED}[FALLA]${NC} No encontré ninguna instalación de Frappe en ${HOMEBASE}.\n"
+    say "    Los atajos se añaden al usuario dueño del bench: instala primero.\n\n"
+    return 1
+  fi
+  local home activo
+  home="$(dirname "$BENCH_DETECTADO")"
+  if [[ -z "$BC_PREFIX" && "${EUID}" -ne 0 && "$(id -un)" != "$USER_DETECTADO" ]]; then
+    say "    ${RED}[FALLA]${NC} El bench es de '${USER_DETECTADO}'. Ejecútalo como root\n"
+    say "    (sudo -i) o como ${USER_DETECTADO}.\n\n"
+    return 1
+  fi
+  if ! instalar_atajos "$USER_DETECTADO" "$home"; then
+    say "    ${RED}[FALLA]${NC} No pude escribir los atajos en ${home}.\n\n"
+    return 1
+  fi
+  activo="$(head -n 1 "${BENCH_DETECTADO}/sites/currentsite.txt" 2>/dev/null | tr -d '[:space:]' || true)"
+  say "    ${GREEN}[ OK ]${NC} Usuario ${USER_DETECTADO}  ·  bench ${BENCH_DETECTADO}\n"
+  say "    ${GREEN}[ OK ]${NC} ~/.frappe-atajos.sh: ${ATAJOS_ARCHIVO}.\n"
+  say "    ${GREEN}[ OK ]${NC} ~/.bashrc: bloque FRAPPE-ATAJOS ${ATAJOS_BLOQUE}.\n"
+  if [[ -n "$activo" ]]; then
+    say "    ${GREEN}[ OK ]${NC} Sitio activo: ${activo}\n\n"
+  else
+    say "    ${YELLOW}[AVISO]${NC} Sin sitio activo. Como ${USER_DETECTADO}: sitio ${SITIO_DETECTADO:-<nombre>}\n\n"
+  fi
+  say "  Se activan en la próxima sesión de ${USER_DETECTADO}, o ya mismo con: ${BOLD}source ~/.bashrc${NC}\n"
+  say "  Escribe ${BOLD}atajos${NC} para ver la lista. bench sigue funcionando igual.\n\n"
+  say "    migrate · build · restart · clear-cache · console · install-app <app>\n"
+  say "    add <app> <enlace> [rama] · deploy · logs · sitio · llaves · b <comando>\n\n"
   return 0
 }
 
@@ -2532,6 +2990,14 @@ if [[ "$ACTION" == "reparar" ]]; then
   exit $?
 fi
 
+# --- Despachador de --atajos [T3] ---------------------------------------------
+# Como --reparar, va antes de la Fase 0: no instala nada del sistema. Lo puede
+# ejecutar root o el propio dueño del bench. Dentro de un 'if' para que un
+# fallo no dispare el trap ERR con su "relanza el MISMO comando".
+if [[ "$ACTION" == "atajos" ]]; then
+  if ejecutar_atajos; then exit 0; else exit 1; fi
+fi
+
 menu_principal() {
   while :; do
     pantalla "¿Qué quieres hacer?"
@@ -2539,14 +3005,16 @@ menu_principal() {
     say "    ${BOLD}2${NC}) Diagnosticar  · revisar servicios, sitio y errores\n"
     say "    ${BOLD}3${NC}) Reparar       · que el sitio vuelva tras reiniciar (no reinstala)\n"
     say "    ${BOLD}4${NC}) Desinstalar   · borrar todo y dejar el sistema como estaba\n"
-    say "    ${BOLD}5${NC}) Salir\n\n  > "
-    local op; read -r op || op=5
+    say "    ${BOLD}5${NC}) Atajos        · 'migrate' en vez de 'bench --site <sitio> migrate'\n"
+    say "    ${BOLD}6${NC}) Salir\n\n  > "
+    local op; read -r op || op=6
     case "$(trim "${op}")" in
       1) if menu_version; then return 0; fi ;;   # continúa a la instalación
       2) menu_diagnostico ;;          # vuelve al menú al terminar
       3) reparar_arranque ;;          # vuelve al menú al terminar
       4) desinstalar ;;               # vuelve al menú al terminar
-      5) say "\n  Hasta luego.\n\n"; exit 0 ;;
+      5) ejecutar_atajos || true ;;   # [T3] vuelve al menú al terminar
+      6) say "\n  Hasta luego.\n\n"; exit 0 ;;
       *) say "  ${RED}Opción no válida. Elige una de la lista.${NC}\n" ;;
     esac
   done
@@ -5547,6 +6015,14 @@ curl -sI -H "Host: ${SITE_NAME}" http://127.0.0.1/ 2>/dev/null \
   | grep -iE 'x-frame-options|x-content-type-options|x-xss-protection|^server:' \
   | sed 's/^/    /' || warn "No se pudieron leer las cabeceras."
 
+# [T3] Atajos de bench para el usuario operativo. Si ya estaban, no se
+# duplican. Un fallo aquí no toca el despliegue: sólo se avisa.
+if instalar_atajos "$NEW_USER" "$USER_HOME"; then
+  ok "Atajos de bench ${ATAJOS_ARCHIVO}; bloque en ~/.bashrc ${ATAJOS_BLOQUE}."
+else
+  warn "No se pudieron instalar los atajos de bench. Más tarde: bash $0 --atajos"
+fi
+
 FAILED_LIST=""
 if [[ -f "${USER_HOME}/.bashcore_failed_apps" ]]; then
   FAILED_LIST="$(tr '\n' ' ' < "${USER_HOME}/.bashcore_failed_apps")"
@@ -5637,6 +6113,7 @@ $(echo -e "${BOLD}COMANDOS ÚTILES${NC}")
   cat /var/log/frappe-boot.log
   sudo -u ${NEW_USER} bash -lc 'cd ${BENCH_DIR} && bench --site ${SITE_NAME} list-apps'
   tail -f ${BENCH_DIR}/logs/worker.error.log
+  atajos    # como ${NEW_USER}: migrate, build, install-app... sin escribir bench --site
 
 $(echo -e "${YELLOW}${BOLD}PENDIENTES RECOMENDADOS${NC}")
   1) Valida el acceso SSH en OTRA terminal ANTES de cerrar esta sesión.
