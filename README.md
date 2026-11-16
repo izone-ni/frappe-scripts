@@ -8,8 +8,9 @@
 
 `frappe-setup.sh` instala Frappe en un servidor Ubuntu limpio: MariaDB, Redis,
 Node, Python, bench, el sitio, las aplicaciones elegidas (ERPNext, HRMS,
-Lending, Wiki) y el pase a producción con Nginx y Supervisor. Además endurece el
-sistema según CIS. Hace 10 preguntas al principio; el resto es desatendido.
+Lending, Wiki) y el pase a producción con Nginx y Supervisor, con HTTPS
+opcional (Let's Encrypt o autofirmado). Además endurece el sistema según CIS.
+Hace 11 preguntas al principio; el resto es desatendido.
 
 ---
 
@@ -18,9 +19,10 @@ sistema según CIS. Hace 10 preguntas al principio; el resto es desatendido.
 1. [Requisitos](#requisitos)
 2. [Instalación](#instalación)
 3. [Después de instalar: cómo entrar al servidor](#después-de-instalar-cómo-entrar-al-servidor)
-4. [Atajos de bench](#atajos-de-bench)
-5. [Otras opciones del script](#otras-opciones-del-script)
-6. [Si algo falla](#si-algo-falla)
+4. [HTTPS](#https)
+5. [Atajos de bench](#atajos-de-bench)
+6. [Otras opciones del script](#otras-opciones-del-script)
+7. [Si algo falla](#si-algo-falla)
 
 ---
 
@@ -84,7 +86,7 @@ administre el servidor que lo añada al grupo `sudo`, o usa la opción A.
 
 1. Aparece el menú principal. Elige **1) Instalar** y la versión de Frappe
    (15 o 16).
-2. Responde las 10 preguntas:
+2. Responde las 11 preguntas:
 
    | # | Pregunta |
    |---|---|
@@ -98,6 +100,7 @@ administre el servidor que lo añada al grupo `sudo`, o usa la opción A.
    | 8 | Contraseña de `Administrator` en Frappe (mínimo 12 caracteres) |
    | 9 | Nombre del sitio, por ejemplo `izone.frappe.software` |
    | 10 | Aplicaciones: ERPNext, HRMS, Lending, Wiki |
+   | 11 | Acceso web: HTTP (por defecto), HTTPS con Let's Encrypt o HTTPS autofirmado. Ver [HTTPS](#https). |
 
    Al final escribe `LISTO` para confirmar, o cualquier otra cosa para repetir
    las preguntas.
@@ -158,13 +161,72 @@ sudo -i
 su - <usuario>
 ```
 
-**Abrir el sitio:** `http://<nombre-del-sitio>/`, con el usuario
-`Administrator` y la contraseña de la pregunta 8. Si el nombre del sitio no
+**Abrir el sitio:** `http://<nombre-del-sitio>/`, o `https://` si elegiste
+HTTPS, con el usuario `Administrator` y la contraseña de la pregunta 8. Si el nombre del sitio no
 tiene DNS, añade al archivo *hosts* de tu equipo la línea
 `<ip-del-servidor>  <nombre-del-sitio>`:
 
 - Windows: `C:\Windows\System32\drivers\etc\hosts`
 - Linux y macOS: `/etc/hosts`
+
+---
+
+## HTTPS
+
+El sitio puede servirse por HTTPS con uno de dos certificados:
+
+| | Let's Encrypt | Autofirmado |
+|---|---|---|
+| **Para qué** | Un sitio público con dominio propio | Un sitio interno, sin dominio público |
+| **El navegador** | Lo acepta sin avisos | Avisa la primera vez: nadie externo lo firma |
+| **Requisitos** | El DNS del sitio apunta a la IP pública del servidor, y los puertos 80 y 443 llegan desde internet | Ninguno |
+| **Duración** | 90 días; se renueva solo | 825 días; se regenera desde el menú |
+
+Con cualquiera de los dos, `http://` redirige a `https://`, y al sitio se entra
+por su nombre (`https://<nombre-del-sitio>/`), no por la IP del servidor: el
+certificado es para el nombre.
+
+### Al instalar
+
+Es la pregunta 11. Se aplica al final de la instalación, cuando el sitio ya
+funciona. Si Let's Encrypt no puede emitir el certificado (el DNS no apunta al
+servidor o el puerto 80 no llega desde internet), la instalación no se pierde:
+el sitio ya funciona por HTTP y el script pregunta qué hacer:
+
+1. Continuar con el sitio en HTTP y activar HTTPS más tarde.
+2. Reintentar, después de corregir el DNS o los puertos.
+3. Detener la instalación. Lanzar el mismo comando otra vez continúa desde el
+   certificado.
+
+### Después de instalar
+
+Como root:
+
+```bash
+bash frappe-setup.sh --https
+```
+
+O `bash frappe-setup.sh` y la opción **6) HTTPS** del menú. Muestra cómo está el
+sitio (HTTP o HTTPS, tipo de certificado y vencimiento) y permite activar Let's
+Encrypt, activar o regenerar el autofirmado, o volver a HTTP. Si algo falla, el
+sitio queda exactamente como estaba.
+
+### Para que el navegador no avise con el autofirmado
+
+El resumen final y `--https` muestran la ruta del certificado
+(`/etc/ssl/bashcore/<sitio>/fullchain.pem`) y su huella SHA-256. Cópialo a tu
+equipo y márcalo como confiable:
+
+- Windows: doble clic → *Instalar certificado* → *Entidades de certificación
+  raíz de confianza*.
+- macOS: ábrelo con *Acceso a Llaveros* y, en *Confiar*, elige *Confiar siempre*.
+- Firefox usa su propio almacén: basta con aceptar la excepción la primera vez.
+
+Regenerarlo cambia la huella: habrá que volver a marcarlo.
+
+> **Ojo al volver a HTTP:** Frappe envía la cabecera HSTS. Un navegador que ya
+> entró por HTTPS con un certificado válido seguirá exigiendo HTTPS hasta 2 años,
+> y no abrirá el sitio por HTTP.
 
 ---
 
@@ -297,19 +359,21 @@ Todas se ejecutan como root (`sudo -i` y luego `bash frappe-setup.sh …`):
 
 | Opción | Para qué |
 |---|---|
-| *(sin opciones)* | Menú: instalar, diagnosticar, reparar, desinstalar o atajos |
+| *(sin opciones)* | Menú: instalar, diagnosticar, reparar, desinstalar, atajos o HTTPS |
 | `--status` | Muestra los pasos de la instalación ya completados |
 | `--attach` | Vuelve a la consola de una instalación en curso |
 | `--reparar` | El sitio no vuelve tras reiniciar el servidor: habilita los servicios y el arranque. No reinstala nada. |
 | `--diag` | Empaqueta los logs en un `.tar.gz` para compartir, con las contraseñas ocultas |
 | `--atajos` | Instala o actualiza los atajos de bench |
+| `--https` | Activa, cambia o quita el HTTPS del sitio |
 | `--reset` | Olvida el progreso guardado. No desinstala nada. |
 | `--python-version X.Y` | Fuerza una versión de Python |
 | `--help` | Ayuda |
 
 **Desinstalar** todo lo que instaló el script: `bash frappe-setup.sh`, opción
 **4) Desinstalar**, y escribe `DESINSTALAR` para confirmar. SSH vuelve al puerto
-22. El usuario operativo y su carpeta sólo se borran si lo confirmas aparte.
+22. También se borran los certificados HTTPS del sitio. El usuario operativo y
+su carpeta sólo se borran si lo confirmas aparte.
 
 ---
 
@@ -322,6 +386,9 @@ Todas se ejecutan como root (`sudo -i` y luego `bash frappe-setup.sh …`):
 | El sitio no responde tras reiniciar el servidor | `bash frappe-setup.sh --reparar` |
 | No puedo entrar por SSH después de instalar | Usa el puerto nuevo (`ssh -p <puerto>`), el usuario operativo y tu llave. `root` ya no entra por SSH. |
 | `migrate: command not found` | Los atajos no están cargados: entra como el usuario operativo y ejecuta `source ~/.bashrc`. Si sigue igual, ejecuta como root `bash frappe-setup.sh --atajos`. |
+| Let's Encrypt no emite el certificado | Comprueba que el DNS del sitio apunte a la IP pública del servidor y que el puerto 80 llegue desde internet (firewall del proveedor, NAT, reenvío en Proxmox). Después: `bash frappe-setup.sh --https` |
+| El navegador avisa de que el sitio no es seguro | Es lo esperado con el autofirmado. Para quitar el aviso, marca el certificado como confiable: ver [HTTPS](#https) |
+| El sitio no carga tras borrar o caducar un certificado | `bash frappe-setup.sh --reparar`: regenera el autofirmado o renueva el de Let's Encrypt |
 | Necesito ayuda con un error | `bash frappe-setup.sh --diag` y comparte el `.tar.gz` que genera en `/root` |
 
 El log completo de la instalación está en `/var/log/bashcore-frappe16.log`.
