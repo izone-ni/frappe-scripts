@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v16.0.14
+#  iZone Enterprise  ::  bashcore-frappe.sh  ::  v16.0.15
 #  https://github.com/izone-ni/frappe-scripts
 #  Despliegue automatizado + hardening de Frappe 15 y 16 / ERPNext
 #  Base: Ubuntu 24.04 LTS   Refs: CIS Ubuntu 24.04 v1.0.0, CIS NGINX v3.0.0
@@ -11,11 +11,41 @@
 #     bash bashcore-frappe16-v2.sh --status     # ver qué pasos van completados
 #     bash bashcore-frappe16-v2.sh --reset      # olvidar el progreso y empezar
 #     bash bashcore-frappe16-v2.sh --atajos     # comandos cortos para bench
+#     bash bashcore-frappe16-v2.sh --https      # activar/cambiar/quitar HTTPS
 #
 #  ENTORNO: VM, hardware físico o CONTENEDOR LXC de Proxmox (CT).
 #  El script detecta el entorno y se adapta. En un CT hay operaciones que el
 #  kernel del host NO delega al contenedor; se detallan en 'AJUSTES EN EL
 #  NODO PROXMOX' al final de esta cabecera.
+#
+#  CAMBIOS v16.0.15 (HTTPS: Let's Encrypt o autofirmado):
+#   CAUSA: el sitio sólo se servía por HTTP. Para cifrarlo había que hacerlo
+#   a mano y 'bench setup lets-encrypt' no sirve desatendido: pide
+#   confirmación, para Nginx y mete un cron en root.
+#
+#   REGLA: sólo se AÑADEN cosas. Quien elige HTTP (la opción por defecto)
+#   obtiene exactamente la instalación de la v16.0.14.
+#   [H1] Pregunta 11/11: HTTP, HTTPS con Let's Encrypt o HTTPS autofirmado.
+#        Las preguntas pasan de 10 a 11.
+#   [H2] FASE 7.6: aplica el certificado al final, con Nginx ya sirviendo.
+#        Si Let's Encrypt falla, el operador elige: seguir en HTTP,
+#        reintentar o detener (relanzar continúa desde el certificado). La
+#        respuesta se lee de /dev/tty: la entrada del script está cerrada
+#        (exec 0</dev/null) desde la confirmación.
+#   [H3] '--https' y la opción 6 del menú (Salir pasa al 7): activar,
+#        cambiar o quitar HTTPS en un servidor ya instalado.
+#   [H4] El certificado se declara en site_config.json y lo aplica
+#        'bench setup nginx': sobrevive a regenerar la configuración y a
+#        '--reparar'. bench sólo lo aplica en modo dns_multitenant, así que
+#        se activa con HTTPS (y se desactiva al volver a HTTP si lo activó
+#        el script). Si 'nginx -t' falla, se restaura lo anterior.
+#   [H5] Socket.io valida las sesiones por 127.0.0.1 (webserver_host): con
+#        un autofirmado, Node rechazaba el certificado del propio sitio.
+#   [H6] Validación final, diagnóstico y '--reparar' entienden HTTPS: con él
+#        el 80 responde 301, que antes se contaba como fallo. '--reparar'
+#        regenera un autofirmado borrado o vencido y renueva Let's Encrypt.
+#   [H7] La desinstalación borra los certificados del sitio, y certbot sólo
+#        si lo instaló este script. '--diag' añade 11-https.txt (sin claves).
 #
 #  CAMBIOS v16.0.14 (atajos para todos los comandos de bench):
 #   CAUSA: los atajos sólo cubrían los comandos del día a día; el resto
@@ -507,12 +537,12 @@ LOG_FILE="${VARDIR}/log/bashcore-frappe16.log"
 # -----------------------------------------------------------------------------
 #  CONSTANTES
 # -----------------------------------------------------------------------------
-TIMEZONE="America/Managua"   # valor por defecto; la pregunta 6/10 lo cambia
+TIMEZONE="America/Managua"   # valor por defecto; la pregunta 7/11 lo cambia
 # Una sola cadena de versión para TODO el script: cabecera, banner, --help y
 # la línea de inicio del log. Antes había tres valores distintos conviviendo
 # (v2.x en la cabecera, v1.0.0 en el banner) y era imposible saber, mirando
 # una captura de pantalla, qué versión había corrido de verdad.
-VERSION_SCRIPT="v16.0.14"
+VERSION_SCRIPT="v16.0.15"
 # ---------------------------------------------------------------------------
 #  MATRIZ DE COMPATIBILIDAD (verificada contra los repositorios de Frappe)
 #    campos: rama | python | node | mariadb | apps | SO compatibles
@@ -539,7 +569,7 @@ PYTHON_VERSION="3.14"
 FRAPPE_BRANCH="version-16"
 WKHTML_VERSION="0.12.6.1-2"
 MIN_RAM_MB=3800
-# Tope de la pregunta 4/10: evita que un pegado accidental entre en bucle.
+# Tope de la pregunta 4/11: evita que un pegado accidental entre en bucle.
 MAX_LLAVES_SSH=8
 SWAP_SIZE="4G"
 
@@ -1076,6 +1106,9 @@ construir_pasos() {
   _paso configs "Configs Nginx/Supervisor"        1  30
   _paso prod    "Pase a producción"               4 240
   _paso web     "Nginx + Supervisor"              2  60
+  if [[ "${HTTPS_MODO:-http}" != "http" ]]; then   # [H1]
+    _paso https "Certificado HTTPS"               1  60
+  fi
 
   # Los pesos deben sumar 100 para que la barra llegue justo al 100%.
   local total=0 i
@@ -1462,6 +1495,7 @@ while (( $# > 0 )); do
     --attach) ACTION="attach" ;;
     --reset)  ACTION="reset"  ;;
     --atajos) ACTION="atajos" ;;
+    --https)  ACTION="https"  ;;
     -h|--help)
       cat <<AYUDA
 bashcore-frappe  ${VERSION_SCRIPT}
@@ -1480,6 +1514,8 @@ bashcore-frappe  ${VERSION_SCRIPT}
   --atajos           Añade comandos cortos para bench al usuario del bench:
                      'migrate' en vez de 'bench --site <sitio> migrate'.
                      Si ya están, no los duplica. bench sigue igual.
+  --https            Activa, cambia o quita el HTTPS del sitio ya instalado:
+                     Let's Encrypt (dominio público) o autofirmado.
   -h, --help         Esta ayuda.
 
 Variables de entorno (pruebas):
@@ -1587,6 +1623,35 @@ if [[ "$ACTION" == "diag" ]]; then
   cp "${ETC}/mysql/mariadb.conf.d/"*.cnf "${DIAG_DIR}/10-config/" 2>/dev/null || true
   cp "${ETC}/nginx/conf.d/"*.conf        "${DIAG_DIR}/10-config/" 2>/dev/null || true
   cp "${ETC}/ssh/sshd_config.d/99-custom.conf" "${DIAG_DIR}/10-config/" 2>/dev/null || true
+
+  # [H1] HTTPS: sólo datos públicos del certificado. La clave privada nunca
+  # entra en el paquete. Va en línea porque las funciones HTTPS se definen
+  # más abajo en el archivo y este bloque corre antes.
+  {
+    for cfg in "${HOMEBASE}"/*/frappe-bench/sites/*/site_config.json; do
+      [[ -f "$cfg" ]] || continue
+      crt="$(python3 -c 'import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("ssl_certificate") or "")
+except Exception:
+    pass' "$cfg" 2>/dev/null || true)"
+      echo "== $(basename "$(dirname "$cfg")") =="
+      if [[ -z "$crt" ]]; then
+        echo "sin HTTPS"
+      else
+        echo "ssl_certificate: ${crt}"
+        openssl x509 -in "$crt" -noout -subject -issuer -dates -ext subjectAltName 2>&1 \
+          || echo "(no se puede leer el certificado)"
+      fi
+      echo
+    done
+    if command -v certbot >/dev/null 2>&1; then
+      echo "== certbot certificates =="; certbot certificates </dev/null 2>&1
+      echo; echo "== certbot.timer =="; systemctl is-enabled certbot.timer 2>&1
+    fi
+    echo; echo "== bashcore-https.log (últimas 150 líneas) =="
+    tail -n 150 "${VARDIR}/log/bashcore-https.log" 2>/dev/null || echo "(no existe)"
+  } > "${DIAG_DIR}/11-https.txt" 2>&1
 
   # Red de seguridad: si alguna contraseña se filtró a un log, se enmascara.
   # [v16.0.6] 'grep' y 'sed' interpretaban la contraseña como expresión
@@ -1797,12 +1862,36 @@ diagnostico() {
       local codigo
       # [v2.2.0] curl YA imprime '000' cuando no conecta, y ADEMÁS sale con
       # código != 0: el '|| echo 000' añadía un segundo 000 y se leía "000000".
-      codigo="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${SITIO_DETECTADO}" http://127.0.0.1/ 2>/dev/null)"
-      codigo="${codigo:0:3}"; codigo="${codigo:-000}"
-      if [[ "$codigo" =~ ^(200|302|303)$ ]]; then
-        say "    ${GREEN}[ OK ]${NC} HTTP ${codigo} en http://${SITIO_DETECTADO}/\n"
+      # [H1] Con HTTPS el 80 responde 301: se prueba el 443 y la redirección.
+      https_rutas "$BENCH_DETECTADO" "$SITIO_DETECTADO"
+      if [[ -n "$HTTPS_CRT" ]]; then
+        codigo="$(https_codigo_https "$SITIO_DETECTADO")"
+        if [[ "$codigo" =~ ^(200|302|303)$ ]]; then
+          say "    ${GREEN}[ OK ]${NC} HTTPS ${codigo} en https://${SITIO_DETECTADO}/\n"
+        else
+          say "    ${RED}[FALLA]${NC} HTTPS ${codigo}: el sitio no responde\n"; fallos=$((fallos+1))
+        fi
+        codigo="$(https_codigo_http "$SITIO_DETECTADO")"
+        if [[ "$codigo" == 301 ]]; then
+          say "    ${GREEN}[ OK ]${NC} http:// redirige a https:// (301)\n"
+        else
+          say "    ${RED}[FALLA]${NC} http:// devolvió ${codigo} en vez de 301\n"; fallos=$((fallos+1))
+        fi
+        https_cert_info "$HTTPS_CRT"
+        if (( ! HTTPS_EXISTE )); then
+          say "    ${RED}[FALLA]${NC} falta el certificado ${HTTPS_CRT}\n"; fallos=$((fallos+1))
+        elif (( HTTPS_DIAS < 0 )); then
+          say "    ${RED}[FALLA]${NC} certificado ${HTTPS_TIPO} VENCIDO el ${HTTPS_VENCE}\n"; fallos=$((fallos+1))
+        else
+          say "    ${GREEN}[ OK ]${NC} certificado ${HTTPS_TIPO}: vence el ${HTTPS_VENCE} (${HTTPS_DIAS} días)\n"
+        fi
       else
-        say "    ${RED}[FALLA]${NC} HTTP ${codigo}: el sitio no responde\n"; fallos=$((fallos+1))
+        codigo="$(https_codigo_http "$SITIO_DETECTADO")"
+        if [[ "$codigo" =~ ^(200|302|303)$ ]]; then
+          say "    ${GREEN}[ OK ]${NC} HTTP ${codigo} en http://${SITIO_DETECTADO}/\n"
+        else
+          say "    ${RED}[FALLA]${NC} HTTP ${codigo}: el sitio no responde\n"; fallos=$((fallos+1))
+        fi
       fi
     else
       say "    ${RED}[FALLA]${NC} no se encontró ningún sitio creado\n"; fallos=$((fallos+1))
@@ -1884,6 +1973,7 @@ desinstalar() {
   say "  Se eliminará TODO lo que instaló este script:\n\n"
   say "    · Procesos y configuración de Supervisor\n"
   say "    · Configuración de Nginx y sus cabeceras\n"
+  say "    · Los certificados HTTPS del sitio (autofirmado y Let's Encrypt)\n"
   say "    · Bases de datos de Frappe y sus usuarios en MariaDB\n"
   say "    · El directorio ${BENCH_DETECTADO:-<bench>} completo\n"
   say "    · Paquetes: mariadb-server, redis, nginx, supervisor, wkhtmltopdf\n"
@@ -1917,6 +2007,17 @@ desinstalar() {
   [[ -f "${ETC}/nginx/nginx.conf.bashcore.bak" ]] && \
     mv "${ETC}/nginx/nginx.conf.bashcore.bak" "${ETC}/nginx/nginx.conf"
 
+  # 2.b Certificados HTTPS [H1]. certbot sólo se desinstala si lo instaló
+  # este script: puede estar gestionando certificados de otros dominios.
+  local certbot_nuestro=0
+  [[ -f "${HTTPS_DIR}/.certbot-por-bashcore" ]] && certbot_nuestro=1
+  if [[ -n "${SITIO_DETECTADO:-}" && -d "${ETC}/letsencrypt/live/${SITIO_DETECTADO}" ]] \
+     && command -v certbot >/dev/null 2>&1; then
+    paso_des "Eliminando el certificado de Let's Encrypt de ${SITIO_DETECTADO}"
+    certbot delete --cert-name "$SITIO_DETECTADO" --non-interactive >/dev/null 2>&1 || true
+  fi
+  rm -rf "$HTTPS_DIR" 2>/dev/null || true
+
   # 3. Bases de datos del sitio
   paso_des "Eliminando bases de datos y usuarios de Frappe en MariaDB"
   if [[ -n "${BENCH_DETECTADO:-}" && -n "${SITIO_DETECTADO:-}" ]]; then
@@ -1947,6 +2048,9 @@ desinstalar() {
   DEBIAN_FRONTEND=noninteractive apt-get purge -y \
     mariadb-server mariadb-client redis-server nginx supervisor wkhtmltox \
     >/dev/null 2>&1 || true
+  if (( certbot_nuestro )); then
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y certbot >/dev/null 2>&1 || true
+  fi
   DEBIAN_FRONTEND=noninteractive apt-get autoremove -y >/dev/null 2>&1 || true
   rm -rf "${ETC}/mysql/mariadb.conf.d/frappe.cnf" "${ETC}/mysql/mariadb.conf.d/zz-lxc.cnf" \
          "${VARDIR}/lib/mysql" "${ETC}/apt/sources.list.d/"mariadb* 2>/dev/null || true
@@ -1986,7 +2090,7 @@ desinstalar() {
   [[ -n "${SITIO_DETECTADO:-}" ]] && sed -i "/[[:space:]]${SITIO_DETECTADO}\$/d" "${ETC}/hosts" 2>/dev/null || true
   : > "${ETC}/issue.net" 2>/dev/null || true
   rm -rf "${VARDIR}/lib/bashcore-frappe"* "${VARDIR}/lib/bashcore" 2>/dev/null || true
-  rm -f "${VARDIR}/log/bashcore-frappe"*.log* 2>/dev/null || true
+  rm -f "${VARDIR}/log/bashcore-frappe"*.log* "$HTTPS_LOG" 2>/dev/null || true
   rm -f "${ROOTDIR}/bashcore-credenciales-"*.txt 2>/dev/null || true
 
   # 9. El usuario, sólo si se pide expresamente
@@ -2619,6 +2723,527 @@ ejecutar_atajos() {
 }
 
 # =============================================================================
+#  HTTPS
+#  [H1] El certificado se declara en site_config.json (ssl_certificate y
+#  ssl_certificate_key). 'bench setup nginx' lo lee y genera el 443 con SSL,
+#  la redirección 301 del 80 y la cabecera HSTS, PERO sólo en modo
+#  dns_multitenant: en el modo por puertos (el de una instalación nueva)
+#  ignora el certificado sin avisar. Por eso se activa junto con HTTPS y se
+#  devuelve a como estaba al volver a HTTP. Así el certificado sobrevive a
+#  'bench setup nginx', a 'setup production' y a '--reparar': nada de lo que
+#  hace este bloque se pierde cuando se regenera la configuración.
+#
+#  Dos tipos de certificado:
+#   · Let's Encrypt: certbot --webroot. Frappe ya sirve sites/<sitio>/public
+#     en la raíz del dominio, así que no hay que parar Nginx ni editar su
+#     configuración. No se usa 'bench setup lets-encrypt': pide confirmación
+#     interactiva, para Nginx y mete un cron en root.
+#   · Autofirmado: openssl, 825 días (el tope que aceptan Apple y los
+#     navegadores), en ${ETC}/ssl/bashcore/<sitio>/.
+#
+#  Las funciones que cambian algo corren en un SUBSHELL con 'set +e' y sin
+#  trap ERR: un fallo aquí nunca tumba la instalación ni el menú. Y Nginx
+#  nunca queda caído: si 'nginx -t' falla, se restaura lo anterior.
+# =============================================================================
+HTTPS_DIR="${ETC}/ssl/bashcore"
+HTTPS_LOG="${VARDIR}/log/bashcore-https.log"
+HTTPS_DIAS_AUTOFIRMADO=825
+
+# Mensajes: a la pantalla (say) y al log (stdout) a la vez.
+_h_ok()  { say "    ${GREEN}[ OK ]${NC} $*\n";   echo "  [ OK ] $*"; }
+_h_bad() { say "    ${RED}[FALLA]${NC} $*\n";    echo "  [FALLA] $*"; }
+_h_act() { say "    ${BOLD}[HECHO]${NC} $*\n";   echo "  [HECHO] $*"; }
+_h_inf() { say "    ${BLUE}[INFO]${NC} $*\n";    echo "  [INFO] $*"; }
+_h_wrn() { say "    ${YELLOW}[AVISO]${NC} $*\n"; echo "  [AVISO] $*"; }
+
+# Valor de una clave de un JSON plano, o vacío. Nunca falla.
+_https_json_get() {   # archivo · clave
+  python3 -c 'import json, sys
+try:
+    v = json.load(open(sys.argv[1], encoding="utf-8")).get(sys.argv[2])
+    print(v if v is not None else "")
+except Exception:
+    pass' "$1" "$2" 2>/dev/null || true
+}
+
+# Pone o quita una clave conservando dueño y permisos. El reemplazo es
+# atómico: site_config.json lleva la contraseña de la base de datos y un
+# archivo a medio escribir dejaría el sitio sin arrancar.
+_https_json_editar() {   # archivo · set|del · clave · [valor]
+  python3 - "$@" <<'PYHJSON'
+import json, os, sys
+ruta, op, clave = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(ruta, encoding="utf-8") as f:
+    cfg = json.load(f)
+if op == "set":
+    cfg[clave] = sys.argv[4]
+else:
+    cfg.pop(clave, None)
+st = os.stat(ruta)
+tmp = ruta + ".tmp-bashcore"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=1, sort_keys=True)
+    f.write("\n")
+os.chmod(tmp, st.st_mode & 0o7777)
+os.chown(tmp, st.st_uid, st.st_gid)
+os.replace(tmp, ruta)
+PYHJSON
+}
+
+# Rutas del certificado que declara el sitio. Vacías = el sitio va por HTTP.
+https_rutas() {   # bench · sitio
+  local cfg="$1/sites/$2/site_config.json"
+  HTTPS_CRT="$(_https_json_get "$cfg" ssl_certificate)"
+  HTTPS_KEY="$(_https_json_get "$cfg" ssl_certificate_key)"
+  return 0
+}
+
+# Tipo, vencimiento y huella de un certificado. El tipo sale de la ruta, así
+# que se conoce aunque el archivo ya no exista (es justo lo que --reparar
+# necesita saber para regenerarlo).
+https_cert_info() {   # ruta del certificado
+  local crt="$1" fin s
+  HTTPS_TIPO="otro"; HTTPS_EXISTE=0; HTTPS_VENCE=""; HTTPS_DIAS=0; HTTPS_HUELLA=""
+  case "$crt" in
+    */letsencrypt/*)    HTTPS_TIPO="letsencrypt" ;;
+    "${HTTPS_DIR}"/*)   HTTPS_TIPO="autofirmado" ;;
+  esac
+  [[ -n "$crt" && -r "$crt" ]] || return 0
+  HTTPS_EXISTE=1
+  fin="$(openssl x509 -in "$crt" -noout -enddate 2>/dev/null || true)"
+  fin="${fin#notAfter=}"
+  if [[ -n "$fin" ]] && s="$(date -d "$fin" +%s 2>/dev/null)"; then
+    HTTPS_VENCE="$(date -d "$fin" +%F 2>/dev/null || true)"
+    HTTPS_DIAS=$(( (s - $(date +%s)) / 86400 ))
+  fi
+  HTTPS_HUELLA="$(openssl x509 -in "$crt" -noout -fingerprint -sha256 2>/dev/null || true)"
+  HTTPS_HUELLA="${HTTPS_HUELLA#*=}"
+  return 0
+}
+
+# Código de respuesta del sitio por cada puerto, sin depender del DNS.
+https_codigo_http() {   # sitio
+  local c
+  c="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -H "Host: $1" http://127.0.0.1/ 2>/dev/null || true)"
+  c="${c:0:3}"; printf '%s' "${c:-000}"
+}
+https_codigo_https() {   # sitio
+  local c
+  c="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 15 --resolve "$1:443:127.0.0.1" "https://$1/" 2>/dev/null || true)"
+  c="${c:0:3}"; printf '%s' "${c:-000}"
+}
+
+# Let's Encrypt sólo emite para nombres públicos. Se descarta antes lo que
+# seguro fallaría: sin punto, una IP o un dominio reservado para redes locales.
+_https_nombre_publico() {   # sitio
+  local s="$1"
+  [[ "$s" == *.* ]] || return 1
+  [[ "$s" =~ ^[0-9.]+$ ]] && return 1
+  case "${s##*.}" in
+    local|localhost|localdomain|lan|home|internal|intranet|corp|test|example|invalid|arpa) return 1 ;;
+  esac
+  return 0
+}
+
+# Genera el autofirmado, o reutiliza el que hay si le quedan más de 30 días
+# y no se pide uno nuevo. Silenciosa: quien la llama decide qué decir.
+# La configuración de openssl va en un archivo propio para no heredar los
+# valores por defecto de cada versión (en la 3.0, -addext choca con el
+# 'CA:true' de v3_ca).
+_https_autofirmado() {   # sitio · forzar (0|1)
+  local s="$1" d="${HTTPS_DIR}/$1" cnf rc
+  HTTPS_REUSADO=0
+  if [[ "${2:-0}" != 1 && -s "$d/fullchain.pem" && -s "$d/privkey.pem" ]] \
+     && openssl x509 -in "$d/fullchain.pem" -noout -checkend $(( 30 * 86400 )) >/dev/null 2>&1; then
+    HTTPS_REUSADO=1
+    return 0
+  fi
+  mkdir -p "$d" || return 1
+  chmod 700 "$HTTPS_DIR" "$d"
+  cnf="$d/.openssl.cnf"
+  cat > "$cnf" <<HSSLCNF
+[req]
+distinguished_name = dn
+x509_extensions = v3
+prompt = no
+[dn]
+CN = ${s}
+[v3]
+subjectAltName = DNS:${s}
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectKeyIdentifier = hash
+HSSLCNF
+  # openssl pinta su progreso en stderr: en '--reparar' saldría en pantalla.
+  # Se guarda aparte y sólo se muestra si falla.
+  ( umask 077
+    openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days "$HTTPS_DIAS_AUTOFIRMADO" \
+      -config "$cnf" -keyout "$d/.nuevo.key" -out "$d/.nuevo.crt" >/dev/null 2>"$d/.openssl.err" )
+  rc=$?
+  rm -f "$cnf"
+  if (( rc != 0 )) || [[ ! -s "$d/.nuevo.crt" || ! -s "$d/.nuevo.key" ]]; then
+    cat "$d/.openssl.err" 2>/dev/null
+    rm -f "$d/.nuevo.crt" "$d/.nuevo.key" "$d/.openssl.err"
+    return 1
+  fi
+  rm -f "$d/.openssl.err"
+  chmod 644 "$d/.nuevo.crt"; chmod 600 "$d/.nuevo.key"
+  mv -f "$d/.nuevo.crt" "$d/fullchain.pem"
+  mv -f "$d/.nuevo.key" "$d/privkey.pem"
+  return 0
+}
+
+# ¿Sirve Nginx un archivo puesto en sites/<sitio>/public/.well-known/? Es lo
+# mismo que Let's Encrypt pedirá desde fuera: si falla aquí, fallará allí, y
+# es mejor saberlo sin gastar un intento (hay un límite por hora).
+_https_webroot_ok() {   # bench · sitio · usuario
+  local pub="$1/sites/$2/public" tok="bashcore-${RANDOM}${RANDOM}" cuerpo
+  mkdir -p "$pub/.well-known/acme-challenge" || return 1
+  chown -R "$3:$3" "$pub/.well-known" 2>/dev/null
+  chmod 755 "$pub/.well-known" "$pub/.well-known/acme-challenge" 2>/dev/null
+  printf '%s' "$tok" > "$pub/.well-known/acme-challenge/$tok"
+  chmod 644 "$pub/.well-known/acme-challenge/$tok"
+  # -L: con HTTPS ya activo el 80 redirige; Let's Encrypt sigue la redirección.
+  cuerpo="$(curl -skL --max-time 15 --resolve "$2:80:127.0.0.1" --resolve "$2:443:127.0.0.1" \
+    "http://$2/.well-known/acme-challenge/$tok" 2>/dev/null || true)"
+  rm -f "$pub/.well-known/acme-challenge/$tok"
+  [[ "$cuerpo" == "$tok" ]]
+}
+
+# Pide el certificado a Let's Encrypt. BC_LE_STAGING=1 usa el entorno de
+# pruebas (certificado NO válido en navegadores, pero sin gastar el límite
+# de 5 certificados iguales por semana).
+_https_certbot() {   # bench · sitio · correo
+  local bd="$1" st="$2" correo="${3:-}" out rc
+  if ! command -v certbot >/dev/null 2>&1; then
+    _h_inf "Instalando certbot..."
+    if ! apt_do install -y certbot; then
+      _h_bad "No se pudo instalar certbot."
+      return 1
+    fi
+    mkdir -p "$HTTPS_DIR" && chmod 700 "$HTTPS_DIR"
+    : > "${HTTPS_DIR}/.certbot-por-bashcore"   # la desinstalación lo quitará
+  fi
+  local -a args=(certonly --webroot -w "${bd}/sites/${st}/public" -d "$st"
+                 --cert-name "$st" --non-interactive --agree-tos --keep-until-expiring
+                 --deploy-hook "systemctl reload nginx")
+  if [[ -n "$correo" ]]; then args+=(--email "$correo")
+  else args+=(--register-unsafely-without-email); fi
+  if [[ "${BC_LE_STAGING:-0}" == 1 ]]; then
+    args+=(--test-cert)
+    _h_wrn "BC_LE_STAGING=1: certificado de PRUEBA, los navegadores no lo aceptan."
+  fi
+  _h_inf "Pidiendo el certificado a Let's Encrypt para ${st}..."
+  out="$(mktemp)"
+  certbot "${args[@]}" >"$out" 2>&1 </dev/null
+  rc=$?
+  cat "$out"
+  if (( rc != 0 )); then
+    _h_bad "Let's Encrypt no emitió el certificado para ${st}:"
+    { grep -E 'Detail:|Type:|Hint:|[Ee]rror' "$out" || tail -n 5 "$out"; } \
+      | head -n 8 | while IFS= read -r l; do say "        ${l}\n"; done
+    say "      Lo habitual: el DNS de ${st} no apunta a la IP pública de este\n"
+    say "      servidor, o el puerto 80 no llega desde internet (firewall, NAT o\n"
+    say "      reenvío de puertos en Proxmox). Detalle completo: ${HTTPS_LOG}\n"
+    rm -f "$out"
+    return 1
+  fi
+  rm -f "$out"
+  # El paquete de Ubuntu trae certbot.timer: renueva dos veces al día lo que
+  # esté a menos de 30 días de vencer, y el deploy-hook recarga Nginx.
+  systemctl enable --now certbot.timer >/dev/null 2>&1 || true
+  return 0
+}
+
+# Socket.io valida cada conexión llamando al propio sitio. Sin
+# 'webserver_host' lo hace por la URL pública (https://sitio): con un
+# autofirmado Node rechaza el certificado y el tiempo real deja de funcionar.
+# Con 'webserver_host' habla directo con gunicorn en 127.0.0.1. Frappe 15 y
+# 16 lo admiten y envían X-Frappe-Site-Name, así que el sitio no se confunde.
+_https_socketio_directo() {   # bench
+  local ccfg="$1/sites/common_site_config.json" p
+  [[ -f "$ccfg" ]] || return 0
+  [[ -n "$(_https_json_get "$ccfg" webserver_host)" ]] && return 0
+  _https_json_editar "$ccfg" set webserver_host 127.0.0.1 || return 1
+  for p in $(supervisorctl status 2>/dev/null | awk '/node-socketio/ {print $1}'); do
+    supervisorctl restart "$p" >/dev/null 2>&1
+  done
+  _h_act "Socket.io valida las sesiones por 127.0.0.1 (webserver_host)."
+  return 0
+}
+
+# Aplica un modo al sitio: letsencrypt, autofirmado o http (quitar HTTPS).
+# Devuelve 0 si quedó aplicado. Si algo falla, el sitio queda como estaba.
+https_activar() (   # modo · bench · sitio · usuario · [correo] · [forzar]
+  set +e
+  trap - ERR
+  local modo="$1" bd="$2" st="$3" ud="$4" correo="${5:-}" forzar="${6:-0}"
+  local cfg="$2/sites/$3/site_config.json" ngx="$2/config/nginx.conf"
+  local ccfg="$2/sites/common_site_config.json"
+  local marca_dns="${HTTPS_DIR}/$3/.dns_multitenant-por-bashcore"
+  local crt="" key="" hn dns cod_s cod_h marca_nueva=0 quitar_marca=0
+  echo "### bashcore https: modo ${modo} para ${st} · $(date -Is) ###"
+
+  if [[ ! -f "$cfg" ]]; then
+    _h_bad "No existe ${cfg}."
+    exit 1
+  fi
+
+  # 1. El certificado.
+  case "$modo" in
+    autofirmado)
+      if ! _https_autofirmado "$st" "$forzar"; then
+        _h_bad "openssl no pudo generar el certificado autofirmado."
+        exit 1
+      fi
+      crt="${HTTPS_DIR}/${st}/fullchain.pem"; key="${HTTPS_DIR}/${st}/privkey.pem"
+      https_cert_info "$crt"
+      if (( HTTPS_REUSADO )); then
+        _h_ok "Se reutiliza el autofirmado existente (vence el ${HTTPS_VENCE})."
+      else
+        _h_act "Certificado autofirmado generado: ${HTTPS_DIAS_AUTOFIRMADO} días."
+      fi
+      ;;
+    letsencrypt)
+      if ! _https_nombre_publico "$st"; then
+        _h_bad "'${st}' no es un dominio público: Let's Encrypt no emite para él."
+        _h_inf "Usa el autofirmado, o un nombre de sitio con dominio real."
+        exit 1
+      fi
+      if ! _https_webroot_ok "$bd" "$st" "$ud"; then
+        _h_bad "Nginx no sirve ${st}/.well-known/acme-challenge/ en este servidor."
+        _h_inf "Let's Encrypt tampoco podría leerlo. Revisa: bash $0 --reparar"
+        exit 1
+      fi
+      _https_certbot "$bd" "$st" "$correo" || exit 1
+      crt="${ETC}/letsencrypt/live/${st}/fullchain.pem"
+      key="${ETC}/letsencrypt/live/${st}/privkey.pem"
+      https_cert_info "$crt"
+      _h_act "Certificado de Let's Encrypt listo (vence el ${HTTPS_VENCE}; se renueva solo)."
+      ;;
+    http) ;;
+    *) _h_bad "Modo desconocido: ${modo}"; exit 1 ;;
+  esac
+
+  # 2. Copia de lo que se va a tocar, para poder volver atrás.
+  cp -p "$cfg" "${cfg}.antes-https"
+  cp -p "$ccfg" "${ccfg}.antes-https"
+  [[ -f "$ngx" ]] && cp -p "$ngx" "${ngx}.antes-https"
+  _https_restaurar() {
+    mv -f "${cfg}.antes-https" "$cfg"
+    mv -f "${ccfg}.antes-https" "$ccfg"
+    [[ -f "${ngx}.antes-https" ]] && mv -f "${ngx}.antes-https" "$ngx"
+    (( marca_nueva )) && rm -f "$marca_dns"
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1
+  }
+
+  # 3. site_config.json. host_name hace que Frappe genere enlaces https en
+  # correos y PDF. Uno personalizado (otro dominio) no se toca.
+  hn="$(_https_json_get "$cfg" host_name)"
+  if [[ -n "$crt" ]]; then
+    if ! { _https_json_editar "$cfg" set ssl_certificate "$crt" \
+           && _https_json_editar "$cfg" set ssl_certificate_key "$key"; }; then
+      _h_bad "No se pudo escribir ${cfg}."
+      _https_restaurar; exit 1
+    fi
+    if [[ -z "$hn" || "$hn" == "http://${st}" ]]; then
+      _https_json_editar "$cfg" set host_name "https://${st}"
+    elif [[ "$hn" != "https://${st}" ]]; then
+      _h_inf "host_name personalizado (${hn}): no se toca."
+    fi
+    # bench sólo genera el 443 en modo dns_multitenant. En el modo por
+    # puertos, el de una instalación nueva, ignora el certificado SIN AVISAR
+    # y deja el sitio en el 80. Se activa y se deja una marca para poder
+    # devolverlo a como estaba al volver a HTTP.
+    dns="$(_https_json_get "$ccfg" dns_multitenant)"
+    if [[ "$dns" != "True" && "$dns" != "1" ]]; then
+      if ! su - "$ud" -c "cd $(sh_quote "$bd") && bench config dns_multitenant on"; then
+        _h_bad "No se pudo activar dns_multitenant en el bench."
+        _https_restaurar; exit 1
+      fi
+      mkdir -p "${HTTPS_DIR}/${st}" && chmod 700 "$HTTPS_DIR" "${HTTPS_DIR}/${st}"
+      : > "$marca_dns"; marca_nueva=1
+      _h_act "Nginx enruta por nombre (dns_multitenant): se entra por https://${st}, no por la IP."
+    fi
+    _https_socketio_directo "$bd"
+  else
+    _https_json_editar "$cfg" del ssl_certificate
+    _https_json_editar "$cfg" del ssl_certificate_key
+    [[ "$hn" == "https://${st}" ]] && _https_json_editar "$cfg" del host_name
+    # dns_multitenant vuelve a como estaba, sólo si lo activó este script.
+    if [[ -f "$marca_dns" ]]; then
+      if su - "$ud" -c "cd $(sh_quote "$bd") && bench config dns_multitenant off"; then
+        quitar_marca=1
+      else
+        _h_wrn "No se pudo desactivar dns_multitenant; el sitio funciona igual por nombre."
+      fi
+    fi
+  fi
+
+  # 4. Nginx: bench regenera su configuración a partir de site_config.json.
+  su - "$ud" -c "cd $(sh_quote "$bd") && bench setup nginx --yes"
+  [[ -f "$ngx" ]] && ln -sf "$ngx" "${ETC}/nginx/conf.d/frappe-bench.conf"
+  if ! nginx -t; then
+    _h_bad "La configuración nueva de Nginx no es válida: se restaura la anterior."
+    { nginx -t 2>&1 || true; } | tail -n 3 | while IFS= read -r l; do say "        ${l}\n"; done
+    _https_restaurar; exit 1
+  fi
+  systemctl reload nginx || systemctl restart nginx
+  rm -f "${cfg}.antes-https" "${ccfg}.antes-https" "${ngx}.antes-https"
+  (( quitar_marca )) && rm -f "$marca_dns"
+
+  # 5. Firewall local: la Fase 1 ya abre el 443; esto cubre servidores
+  # donde UFW se activó después.
+  if [[ -n "$crt" ]] && command -v ufw >/dev/null 2>&1 \
+     && ufw status 2>/dev/null | grep -q "Status: active" \
+     && ! ufw status 2>/dev/null | grep -qE '^443(/tcp)?[[:space:]]'; then
+    ufw allow 443/tcp >/dev/null 2>&1 && _h_act "UFW: abierto el puerto 443."
+  fi
+
+  # 6. Comprobación con peticiones reales.
+  sleep 2
+  cod_h="$(https_codigo_http "$st")"
+  if [[ -n "$crt" ]]; then
+    cod_s="$(https_codigo_https "$st")"
+    if [[ "$cod_s" =~ ^(200|302|303)$ ]]; then
+      _h_ok "https://${st}/ responde (${cod_s})."
+    else
+      _h_wrn "https://${st}/ devolvió ${cod_s}. Revisa: supervisorctl status"
+    fi
+    if [[ "$cod_h" == 301 ]]; then
+      _h_ok "http://${st}/ redirige a HTTPS (301)."
+    else
+      _h_wrn "http://${st}/ devolvió ${cod_h} en vez de 301."
+    fi
+  elif [[ "$cod_h" =~ ^(200|302|303)$ ]]; then
+    _h_ok "http://${st}/ responde (${cod_h})."
+  else
+    _h_wrn "http://${st}/ devolvió ${cod_h}. Revisa: supervisorctl status"
+  fi
+  exit 0
+)
+
+# Estado actual en pantalla: tipo, vencimiento y respuesta de cada puerto.
+https_estado() {   # bench · sitio
+  local h s t timer
+  https_rutas "$1" "$2"
+  h="$(https_codigo_http "$2")"
+  if [[ -z "$HTTPS_CRT" ]]; then
+    say "  Acceso actual : ${BOLD}HTTP${NC}, sin certificado   (http://$2/ → ${h})\n"
+    return 0
+  fi
+  https_cert_info "$HTTPS_CRT"
+  s="$(https_codigo_https "$2")"
+  case "$HTTPS_TIPO" in
+    letsencrypt) t="Let's Encrypt" ;;
+    autofirmado) t="autofirmado" ;;
+    *)           t="certificado propio" ;;
+  esac
+  say "  Acceso actual : ${BOLD}HTTPS${NC} · ${t}   (https → ${s} · http → ${h})\n"
+  if (( ! HTTPS_EXISTE )); then
+    say "  ${RED}${BOLD}No existe ${HTTPS_CRT}:${NC}${RED} Nginx no podrá arrancar.${NC}\n"
+    say "  ${RED}Vuelve a activar HTTPS (opción 1 o 2) o quítalo (opción 3).${NC}\n"
+    return 0
+  fi
+  if (( HTTPS_DIAS < 0 )); then
+    say "  Vencimiento   : ${RED}${BOLD}VENCIDO${NC} el ${HTTPS_VENCE}\n"
+  else
+    say "  Vencimiento   : ${HTTPS_VENCE}  (quedan ${HTTPS_DIAS} días)\n"
+  fi
+  if [[ "$HTTPS_TIPO" == letsencrypt ]]; then
+    timer="$(systemctl is-enabled certbot.timer 2>/dev/null || true)"
+    say "  Renovación    : automática (certbot.timer: ${timer:-no existe})\n"
+  elif [[ "$HTTPS_TIPO" == autofirmado ]]; then
+    say "  Huella SHA-256: ${HTTPS_HUELLA}\n"
+    say "  Certificado   : ${HTTPS_CRT}\n"
+  fi
+  return 0
+}
+
+# Menú de '--https' y de la opción 6. En subshell: 'set +e' y el trap ERR
+# retirado no se filtran al menú principal ni a una instalación posterior.
+https_menu() (
+  set +e
+  trap - ERR
+  mkdir -p "$(dirname "$HTTPS_LOG")"
+  touch "$HTTPS_LOG"; chmod 600 "$HTTPS_LOG"
+  exec >>"$HTTPS_LOG" 2>&1
+  local BD UD ST op correo forzar
+  if ! detectar_instalacion || [[ -z "$SITIO_DETECTADO" ]]; then
+    say "\n  ${RED}No encontré ninguna instalación de Frappe con un sitio en ${HOMEBASE}.${NC}\n"
+    say "  Instala primero (opción 1 del menú).\n\n"
+    exit 1
+  fi
+  BD="$BENCH_DETECTADO"; UD="$USER_DETECTADO"; ST="$SITIO_DETECTADO"
+  while :; do
+    pantalla "HTTPS del sitio ${ST}"
+    https_estado "$BD" "$ST"
+    say "\n  ${BOLD}¿Qué quieres hacer?${NC}\n\n"
+    say "    ${BOLD}1${NC}) HTTPS con Let's Encrypt · certificado válido; requiere dominio público\n"
+    say "    ${BOLD}2${NC}) HTTPS autofirmado       · sin dominio público; el navegador avisa\n"
+    say "    ${BOLD}3${NC}) Volver a HTTP           · quita el certificado del sitio\n"
+    say "    ${BOLD}0${NC}) Volver\n\n  > "
+    read -r op || op=0
+    case "$(trim "$op")" in
+      1)
+        if ! _https_nombre_publico "$ST"; then
+          say "\n  ${RED}'${ST}' no es un dominio público: Let's Encrypt no emite para él.${NC}\n"
+          say "  Usa el autofirmado (opción 2).\n"
+        else
+          say "\n  Requisitos: el DNS de ${BOLD}${ST}${NC} apunta a la IP pública de este\n"
+          say "  servidor y los puertos 80 y 443 llegan desde internet.\n\n"
+          say "  Correo para avisos de Let's Encrypt (Enter = sin correo): "
+          read -r correo || correo=""
+          correo="$(trim "$correo")"
+          if [[ -n "$correo" && ! "$correo" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+            say "  ${RED}Correo no válido. No se ha cambiado nada.${NC}\n"
+          else
+            say "\n"
+            https_activar letsencrypt "$BD" "$ST" "$UD" "$correo" \
+              || say "\n  ${YELLOW}No se ha cambiado nada: el sitio sigue como estaba.${NC}\n"
+          fi
+        fi
+        ;;
+      2)
+        forzar=0
+        https_rutas "$BD" "$ST"
+        if [[ -s "${HTTPS_DIR}/${ST}/fullchain.pem" ]]; then
+          https_cert_info "${HTTPS_DIR}/${ST}/fullchain.pem"
+          say "\n  Ya hay un autofirmado que vence el ${HTTPS_VENCE}.\n"
+          say "  Uno nuevo cambia la huella: quien lo marcó como confiable tendrá que repetirlo.\n"
+          ask_yn "¿Generar uno nuevo?" n && forzar=1
+        fi
+        say "\n"
+        https_activar autofirmado "$BD" "$ST" "$UD" "" "$forzar" \
+          || say "\n  ${YELLOW}No se ha cambiado nada: el sitio sigue como estaba.${NC}\n"
+        ;;
+      3)
+        https_rutas "$BD" "$ST"
+        if [[ -z "$HTTPS_CRT" ]]; then
+          say "\n  El sitio ya va por HTTP.\n"
+        else
+          say "\n  ${YELLOW}Frappe envía HSTS: los navegadores que ya entraron por HTTPS con un${NC}\n"
+          say "  ${YELLOW}certificado válido seguirán exigiéndolo hasta 2 años y no abrirán el${NC}\n"
+          say "  ${YELLOW}sitio por HTTP. Los archivos del certificado se conservan.${NC}\n\n"
+          if ask_yn "¿Quitar HTTPS y volver a HTTP?" n; then
+            say "\n"
+            https_activar http "$BD" "$ST" "$UD" \
+              || say "\n  ${YELLOW}No se ha cambiado nada: el sitio sigue como estaba.${NC}\n"
+          else
+            say "  Cancelado.\n"
+          fi
+        fi
+        ;;
+      0) exit 0 ;;
+      *) say "  ${RED}Opción no válida. Elige una de la lista.${NC}\n"; sleep 1; continue ;;
+    esac
+    say "\n  ${BOLD}Enter${NC} para continuar: "
+    read -r _ || exit 0
+  done
+)
+
+# =============================================================================
 #  MENÚ PRINCIPAL
 # =============================================================================
 so_actual() {
@@ -2929,6 +3554,57 @@ NGXLOGF
   fi
 
 
+  # --- 3.c Certificado HTTPS [H1] -------------------------------------------
+  # Un site_config.json que apunta a un certificado borrado o vencido impide
+  # arrancar nginx ('cannot load certificate') y tumba TODO, también el 80.
+  # El saneador de duplicados de abajo no lo arreglaría: se trata aquí, antes.
+  if [[ -n "$ST" ]]; then
+    https_rutas "$BD" "$ST"
+    if [[ -n "$HTTPS_CRT" ]]; then
+      https_cert_info "$HTTPS_CRT"
+      if (( HTTPS_EXISTE )) && [[ -r "$HTTPS_KEY" ]] \
+         && openssl x509 -checkend 0 -noout -in "$HTTPS_CRT" >/dev/null 2>&1; then
+        r_ok "certificado ${HTTPS_TIPO} vigente hasta el ${HTTPS_VENCE}."
+      else
+        case "$HTTPS_TIPO" in
+          autofirmado)
+            if _https_autofirmado "$ST" 1; then
+              r_act "certificado autofirmado regenerado (la huella cambia)."
+            else
+              r_bad "no pude regenerar el autofirmado. Vuelve a HTTP con: bash $0 --https"
+            fi ;;
+          letsencrypt)
+            if certbot renew --cert-name "$ST" --non-interactive >/dev/null 2>&1 \
+               && [[ -r "$HTTPS_CRT" ]]; then
+              r_act "certificado de Let's Encrypt renovado."
+            else
+              r_bad "Let's Encrypt no renovó ${ST}: revisa el DNS y el puerto 80,"
+              r_bad "o vuelve a HTTP / al autofirmado con: bash $0 --https"
+            fi ;;
+          *)
+            r_bad "falta o venció ${HTTPS_CRT}, que este script no gestiona."
+            r_bad "Reponlo, o cambia de certificado con: bash $0 --https" ;;
+        esac
+      fi
+      # Sin dns_multitenant bench ignora el certificado y no abre el 443.
+      local dnsm
+      dnsm="$(_https_json_get "${BD}/sites/common_site_config.json" dns_multitenant)"
+      if [[ "$dnsm" != "True" && "$dnsm" != "1" ]]; then
+        if su - "$UD" -c "cd $(sh_quote "$BD") && bench config dns_multitenant on && bench setup nginx --yes" >/dev/null 2>&1; then
+          mkdir -p "${HTTPS_DIR}/${ST}" && : > "${HTTPS_DIR}/${ST}/.dns_multitenant-por-bashcore"
+          r_act "dns_multitenant activado y Nginx regenerado: sin él no se abría el 443."
+        else
+          r_bad "el bench no está en dns_multitenant y no pude activarlo: Nginx no abre el 443."
+        fi
+      fi
+      if [[ "$HTTPS_TIPO" == letsencrypt ]] && ! systemctl is-enabled --quiet certbot.timer 2>/dev/null; then
+        systemctl enable --now certbot.timer >/dev/null 2>&1 \
+          && r_act "certbot.timer habilitado: renovación automática." \
+          || r_bad "no pude habilitar certbot.timer."
+      fi
+    fi
+  fi
+
   # --- 3.b Directivas duplicadas que impiden arrancar nginx ----------------
   # Síntoma real en campo:
   #   [emerg] "server_tokens" directive is duplicate in
@@ -3160,14 +3836,22 @@ BOOTUNIT
   r_chk "configuración de Nginx válida"  nginx -t
 
   if [[ -n "$ST" ]]; then
-    local cod
-    cod="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${ST}" http://127.0.0.1/ 2>/dev/null)"
-    cod="${cod:0:3}"; cod="${cod:-000}"
+    local cod esquema="HTTP"
+    # [H1] Con HTTPS el 80 responde 301: lo que hay que comprobar es el 443.
+    https_rutas "$BD" "$ST"
+    if [[ -n "$HTTPS_CRT" ]]; then
+      esquema="HTTPS"
+      r_chk "puerto 443 escuchando"       bash -c "ss -H -tln | grep -q ':443[[:space:]]'"
+      r_chk "certificado HTTPS vigente"   openssl x509 -checkend 0 -noout -in "$HTTPS_CRT"
+      cod="$(https_codigo_https "$ST")"
+    else
+      cod="$(https_codigo_http "$ST")"
+    fi
     total=$((total+1))
     if [[ "$cod" =~ ^(200|302|303)$ ]]; then
-      r_ok "el sitio responde por HTTP (${cod})."; aciertos=$((aciertos+1))
+      r_ok "el sitio responde por ${esquema} (${cod})."; aciertos=$((aciertos+1))
     else
-      r_bad "el sitio devolvió ${cod}."
+      r_bad "el sitio devolvió ${cod} por ${esquema}."
     fi
   fi
 
@@ -3214,6 +3898,16 @@ if [[ "$ACTION" == "atajos" ]]; then
   if ejecutar_atajos; then exit 0; else exit 1; fi
 fi
 
+# --- Despachador de --https [H1] ----------------------------------------------
+# Como --reparar: actúa sobre un despliegue ya instalado, antes de la Fase 0.
+if [[ "$ACTION" == "https" ]]; then
+  if [[ -z "$BC_PREFIX" && "${EUID}" -ne 0 ]]; then
+    echo "HTTPS necesita root. Usa:  sudo -i  y luego  bash $0 --https" >&2
+    exit 1
+  fi
+  if https_menu; then exit 0; else exit 1; fi
+fi
+
 menu_principal() {
   while :; do
     pantalla "¿Qué quieres hacer?"
@@ -3222,15 +3916,17 @@ menu_principal() {
     say "    ${BOLD}3${NC}) Reparar       · que el sitio vuelva tras reiniciar (no reinstala)\n"
     say "    ${BOLD}4${NC}) Desinstalar   · borrar todo y dejar el sistema como estaba\n"
     say "    ${BOLD}5${NC}) Atajos        · 'migrate' en vez de 'bench --site <sitio> migrate'\n"
-    say "    ${BOLD}6${NC}) Salir\n\n  > "
-    local op; read -r op || op=6
+    say "    ${BOLD}6${NC}) HTTPS         · activar, cambiar o quitar el certificado del sitio\n"
+    say "    ${BOLD}7${NC}) Salir\n\n  > "
+    local op; read -r op || op=7
     case "$(trim "${op}")" in
       1) if menu_version; then return 0; fi ;;   # continúa a la instalación
       2) menu_diagnostico ;;          # vuelve al menú al terminar
       3) reparar_arranque ;;          # vuelve al menú al terminar
       4) desinstalar ;;               # vuelve al menú al terminar
       5) ejecutar_atajos || true ;;   # [T3] vuelve al menú al terminar
-      6) say "\n  Hasta luego.\n\n"; exit 0 ;;
+      6) https_menu || true ;;        # [H1] vuelve al menú al terminar
+      7) say "\n  Hasta luego.\n\n"; exit 0 ;;
       *) say "  ${RED}Opción no válida. Elige una de la lista.${NC}\n" ;;
     esac
   done
@@ -3432,19 +4128,19 @@ menu_principal
 ok "Se instalará Frappe ${FRAPPE_VER} (${FRAPPE_BRANCH})."
 
 # =============================================================================
-#  LAS 10 PREGUNTAS  (único tramo interactivo)
+#  LAS 11 PREGUNTAS  (único tramo interactivo)
 # =============================================================================
 # [Z3] Las 7 preguntas viven dentro de un bucle: si la confirmación final no
 # es LISTO, se repiten todas desde el principio. Los bloques no se indentan
 # a propósito: los delimitadores de heredoc deben quedar en la columna 0.
 while :; do
 
-phase "PARÁMETROS DE DESPLIEGUE (10 preguntas)"
+phase "PARÁMETROS DE DESPLIEGUE (11 preguntas)"
 
 # --- 1) Nombre de la empresa -------------------------------------------------
-pantalla "Parámetros del despliegue  ·  1 de 10"
-say "${YELLOW}Tras estas 10 preguntas, el resto es desatendido.${NC}\n\n"
-say "${BOLD}1/10${NC} Nombre de la empresa (si es largo, el encabezado usa sus siglas): "
+pantalla "Parámetros del despliegue  ·  1 de 11"
+say "${YELLOW}Tras estas 11 preguntas, el resto es desatendido.${NC}\n\n"
+say "${BOLD}1/11${NC} Nombre de la empresa (si es largo, el encabezado usa sus siglas): "
 while :; do
   read -r EMPRESA
   EMPRESA="$(trim "$EMPRESA")"
@@ -3457,7 +4153,7 @@ while :; do
   break
 done
 # El banner de la empresa pasa a la cabecera de cada pantalla: se ve en las
-# nueve preguntas siguientes en lugar de aparecer y desaparecer aquí.
+# diez preguntas siguientes en lugar de aparecer y desaparecer aquí.
 
 # --- 2) Usuario operativo ----------------------------------------------------
 # En un servidor ya en uso suele existir un usuario administrativo en el grupo
@@ -3475,13 +4171,13 @@ if [[ -n "$SUGERENCIA" ]]; then
   info "Usuarios con sudo detectados: ${SUDO_USERS}"
 fi
 
-pantalla "Parámetros del despliegue  ·  2 de 10"
+pantalla "Parámetros del despliegue  ·  2 de 11"
 [[ -n "$SUGERENCIA" ]] && say "  Usuarios con sudo detectados: ${BOLD}${SUDO_USERS}${NC}\n\n"
 while :; do
   if [[ -n "$SUGERENCIA" ]]; then
-  say "${BOLD}2/10${NC} Usuario operativo (ej: sysadmin; se crea si no existe) [${BOLD}${SUGERENCIA}${NC}]: "
+  say "${BOLD}2/11${NC} Usuario operativo (ej: sysadmin; se crea si no existe) [${BOLD}${SUGERENCIA}${NC}]: "
 else
-  say "${BOLD}2/10${NC} Usuario operativo (ej: sysadmin; se crea si no existe): "
+  say "${BOLD}2/11${NC} Usuario operativo (ej: sysadmin; se crea si no existe): "
 fi
   read -r NEW_USER
   NEW_USER="$(trim "$NEW_USER")"
@@ -3503,12 +4199,12 @@ done
 # --- 3) Contraseña del usuario operativo [F4] --------------------------------
 # Se pregunta explícitamente: es la clave que usarás para 'sudo'. El acceso
 # SSH seguirá siendo SÓLO por llave (PasswordAuthentication no).
-pantalla "Parámetros del despliegue  ·  3 de 10"
+pantalla "Parámetros del despliegue  ·  3 de 11"
 if id "$NEW_USER" &>/dev/null; then
-  say "\n${BOLD}3/10${NC} Contraseña de '${NEW_USER}', que ya existe (mín. 12 caracteres)\n"
+  say "\n${BOLD}3/11${NC} Contraseña de '${NEW_USER}', que ya existe (mín. 12 caracteres)\n"
   say "      Se le aplica la que escribas: la actual o una nueva.\n"
 else
-  say "\n${BOLD}3/10${NC} Contraseña del usuario nuevo '${NEW_USER}' (mín. 12 caracteres)\n"
+  say "\n${BOLD}3/11${NC} Contraseña del usuario nuevo '${NEW_USER}' (mín. 12 caracteres)\n"
   say "      Admite cualquier carácter, también comillas y espacios.\n"
 fi
 while :; do
@@ -3536,8 +4232,8 @@ ok "Contraseña del usuario aceptada (${#OS_USER_PASS} caracteres)."
 # --- 4) Llaves públicas SSH ------------------------------------------------
 # Al menos una es obligatoria: el acceso por contraseña queda desactivado y
 # sin llave el operador se queda fuera del servidor.
-pantalla "Parámetros del despliegue  ·  4 de 10"
-say "\n${BOLD}4/10${NC} Llave pública SSH para '${NEW_USER}' (una sola línea)\n"
+pantalla "Parámetros del despliegue  ·  4 de 11"
+say "\n${BOLD}4/11${NC} Llave pública SSH para '${NEW_USER}' (una sola línea)\n"
 say "      Podrás añadir más después de cada una (máx. ${MAX_LLAVES_SSH}).\n"
 SSH_PUBKEYS=(); SSH_HUELLAS=()
 while :; do
@@ -3602,9 +4298,9 @@ done
 unset _llave _k _dup _tipo _huella _r
 
 # --- 5) Puerto SSH -----------------------------------------------------------
-pantalla "Parámetros del despliegue  ·  5 de 10"
+pantalla "Parámetros del despliegue  ·  5 de 11"
 while :; do
-  say "\n${BOLD}5/10${NC} Puerto SSH nuevo (ej: 2222; el 22 se cerrará): "
+  say "\n${BOLD}5/11${NC} Puerto SSH nuevo (ej: 2222; el 22 se cerrará): "
   read -r SSH_PORT
   SSH_PORT="$(trim "$SSH_PORT")"
   if [[ ! "$SSH_PORT" =~ ^[0-9]+$ ]] || (( SSH_PORT < 1024 || SSH_PORT > 65535 )); then
@@ -3628,8 +4324,8 @@ while :; do
 done
 
 # --- 6) Password de root de MariaDB ------------------------------------------
-pantalla "Parámetros del despliegue  ·  6 de 10"
-say "\n${BOLD}6/10${NC} Contraseña de 'root' en MariaDB (mín. 12 caracteres)\n"
+pantalla "Parámetros del despliegue  ·  6 de 11"
+say "\n${BOLD}6/11${NC} Contraseña de 'root' en MariaDB (mín. 12 caracteres)\n"
 say "      Admite cualquier carácter, también comillas y espacios.\n"
 while :; do
   say "     Contraseña: "; read -rs DB_ROOT_PASS; say "\n"
@@ -3653,8 +4349,8 @@ unset DB_ROOT_PASS2
 ok "Contraseña de MariaDB aceptada (${#DB_ROOT_PASS} caracteres)."
 
 # --- 7) Zona horaria ---------------------------------------------------------
-pantalla "Parámetros del despliegue  ·  7 de 10"
-say "\n${BOLD}7/10${NC} Zona horaria [${BOLD}America/Managua${NC}]: "
+pantalla "Parámetros del despliegue  ·  7 de 11"
+say "\n${BOLD}7/11${NC} Zona horaria [${BOLD}America/Managua${NC}]: "
 while :; do
   read -r TZ_IN
   TZ_IN="$(trim "$TZ_IN")"
@@ -3671,8 +4367,8 @@ done
 ok "Zona horaria: ${TIMEZONE}"
 
 # --- 8) Contraseña del Administrator de Frappe [F4] -------------------------
-pantalla "Parámetros del despliegue  ·  8 de 10"
-say "\n${BOLD}8/10${NC} Contraseña de 'Administrator' en Frappe (mín. 12 caracteres)\n"
+pantalla "Parámetros del despliegue  ·  8 de 11"
+say "\n${BOLD}8/11${NC} Contraseña de 'Administrator' en Frappe (mín. 12 caracteres)\n"
 say "      Admite cualquier carácter, también comillas y espacios.\n"
 while :; do
   say "     Contraseña: "; read -rs ADMIN_PASS; say "\n"
@@ -3696,9 +4392,9 @@ unset ADMIN_PASS2
 ok "Contraseña de Administrator aceptada (${#ADMIN_PASS} caracteres)."
 
 # --- 9) Nombre del sitio -----------------------------------------------------
-pantalla "Parámetros del despliegue  ·  9 de 10"
+pantalla "Parámetros del despliegue  ·  9 de 11"
 while :; do
-  say "\n${BOLD}9/10${NC} Nombre del sitio (ej: misitio.com): "
+  say "\n${BOLD}9/11${NC} Nombre del sitio (ej: misitio.com): "
   read -r SITE_NAME
   SITE_NAME="$(trim "$SITE_NAME")"
   SITE_NAME="${SITE_NAME,,}"                    # a minúsculas (Bash 4+)
@@ -3716,8 +4412,8 @@ done
 # estaba escrito a mano con las cuatro de Frappe 16, así que al instalar la 13
 # ofrecía HRMS y Lending, que no tienen rama en esa versión: el despliegue
 # llegaba hasta 'bench get-app' y fallaba allí, 40 minutos después.
-pantalla "Parámetros del despliegue  ·  10 de 10"
-say "${BOLD}10/10${NC} ¿Qué aplicaciones quieres instalar? (Frappe ${FRAPPE_VER})\n\n"
+pantalla "Parámetros del despliegue  ·  10 de 11"
+say "${BOLD}10/11${NC} ¿Qué aplicaciones quieres instalar? (Frappe ${FRAPPE_VER})\n\n"
 
 OPC_ETIQ=(); OPC_VAL=()
 _opc_app() { OPC_ETIQ+=("$1"); OPC_VAL+=("$2"); }
@@ -3764,6 +4460,57 @@ case " ${APPS_SEL} " in
 esac
 ok "Aplicaciones: ${APPS_SEL:-(sólo el framework)}"
 
+# --- 11) HTTPS [H1] ------------------------------------------------------------
+# Se aplica al final (FASE 7.6), cuando Nginx ya sirve el sitio. Lo mismo se
+# puede hacer después con '--https' o con la opción 6 del menú.
+pantalla "Parámetros del despliegue  ·  11 de 11"
+say "${BOLD}11/11${NC} ¿Cómo se entrará al sitio ${BOLD}${SITE_NAME}${NC}?\n\n"
+say "      ${BOLD}1${NC}) HTTP, sin certificado, como hasta ahora   ${BOLD}(Enter)${NC}\n"
+say "      ${BOLD}2${NC}) HTTPS con Let's Encrypt: certificado válido y gratuito.\n"
+say "         Requiere que ${SITE_NAME} sea un dominio público que apunte a este\n"
+say "         servidor, con los puertos 80 y 443 abiertos desde internet.\n"
+say "      ${BOLD}3${NC}) HTTPS autofirmado: cifrado sin dominio público. El navegador\n"
+say "         avisará la primera vez, porque no lo firma una entidad externa.\n\n"
+say "      Se puede cambiar después: bash $0 --https\n"
+HTTPS_MODO=""; HTTPS_EMAIL=""
+while :; do
+  say "\n      > "
+  read -r _https_op || _https_op=1
+  case "$(trim "$_https_op")" in
+    ""|1) HTTPS_MODO="http" ;;
+    2) if _https_nombre_publico "$SITE_NAME"; then
+         HTTPS_MODO="letsencrypt"
+       else
+         fail "'${SITE_NAME}' no es un dominio público: Let's Encrypt no emite para él."
+         fail "Elige el autofirmado (3), o repite las preguntas con otro nombre de sitio."
+         continue
+       fi ;;
+    3) HTTPS_MODO="autofirmado" ;;
+    *) fail "Elige 1, 2 o 3."; continue ;;
+  esac
+  break
+done
+if [[ "$HTTPS_MODO" == "letsencrypt" ]]; then
+  say "\n      Correo para avisos de Let's Encrypt (Enter = sin correo): "
+  while :; do
+    read -r HTTPS_EMAIL || HTTPS_EMAIL=""
+    HTTPS_EMAIL="$(trim "$HTTPS_EMAIL")"
+    if [[ -z "$HTTPS_EMAIL" || "$HTTPS_EMAIL" =~ ^[^[:space:]@\'\"]+@[^[:space:]@\'\"]+\.[^[:space:]@\'\"]+$ ]]; then
+      break
+    fi
+    fail "Correo no válido."; say "      > "
+  done
+fi
+unset _https_op
+case "$HTTPS_MODO" in
+  letsencrypt) HTTPS_ETIQ="HTTPS · Let's Encrypt${HTTPS_EMAIL:+ (${HTTPS_EMAIL})}" ;;
+  autofirmado) HTTPS_ETIQ="HTTPS · autofirmado (${HTTPS_DIAS_AUTOFIRMADO} días)" ;;
+  *)           HTTPS_ETIQ="HTTP, sin certificado" ;;
+esac
+ok "Acceso web: ${HTTPS_ETIQ}"
+# La barra de progreso gana el paso del certificado sólo si hace falta.
+construir_pasos
+
 # --- Derivados ---------------------------------------------------------------
 USER_HOME="${HOMEBASE}/${NEW_USER}"
 BENCH_DIR="${USER_HOME}/frappe-bench"
@@ -3780,6 +4527,7 @@ SITE_NAME='${SITE_NAME}'
 SSH_PORT='${SSH_PORT}'
 NEW_USER='${NEW_USER}'
 BENCH_DIR='${BENCH_DIR}'
+HTTPS_MODO='${HTTPS_MODO}'
 # Usuario de la aplicación: Administrator (con la contraseña que indicaste)
 CRED
 chmod 600 "$CRED_FILE"
@@ -3799,6 +4547,7 @@ fi
 tabla_fila "Frappe"           "${FRAPPE_BRANCH}"
 tabla_fila "Aplicaciones"     "$(apps_bonitas "${APPS_SEL}")"
 tabla_fila "Sitio"            "${SITE_NAME}"
+tabla_fila "Acceso web"       "${HTTPS_ETIQ}"
 tabla_sep
 tabla_fila "Usuario operativo" "${NEW_USER}"
 tabla_fila "Puerto SSH"       "${SSH_PORT}   (el 22 quedará CERRADO)"
@@ -3841,7 +4590,7 @@ case "$CONFIRM" in
     warn "Operación cancelada. No se ha modificado nada."
     exit 0 ;;
   *)
-    warn "No escribiste LISTO: repetimos las 10 preguntas desde el principio."
+    warn "No escribiste LISTO: repetimos las 11 preguntas desde el principio."
     warn "(escribe SALIR en la confirmación si quieres terminar)"
     say "\n"
     continue ;;
@@ -4128,7 +4877,7 @@ else
     ok "Agregado al grupo sudo."
   fi
 
-  # e) Contraseña: la que indicaste en la pregunta 3/10.
+  # e) Contraseña: la que indicaste en la pregunta 3/11.
   if printf '%s:%s\n' "$NEW_USER" "$OS_USER_PASS" | chpasswd; then
     ok "Contraseña de '${NEW_USER}' establecida."
   else
@@ -4146,7 +4895,7 @@ fi
 # aunque el paso de creación del usuario ya estuviera completado.
 if id "$NEW_USER" &>/dev/null; then
   if printf '%s:%s\n' "$NEW_USER" "$OS_USER_PASS" | chpasswd; then
-    ok "Contraseña de '${NEW_USER}' vigente (la de la pregunta 3/10)."
+    ok "Contraseña de '${NEW_USER}' vigente (la de la pregunta 3/11)."
   else
     warn "No se pudo fijar la contraseña de '${NEW_USER}'."
   fi
@@ -4164,7 +4913,7 @@ fi
 # --- 1.2 Migración de llaves SSH (antes de tocar sshd) ----------------------
 if is_done fase1_llaves; then
   skip "Migración de llaves SSH"
-  # Las llaves de la pregunta 4/10 se aplican aunque el paso esté completado:
+  # Las llaves de la pregunta 4/11 se aplican aunque el paso esté completado:
   # si en esta ejecución se añadió una, el checkpoint no debe dejarla fuera.
   AUTH_KEYS="${USER_HOME}/.ssh/authorized_keys"
   if [[ -f "$AUTH_KEYS" ]]; then
@@ -5257,7 +6006,7 @@ get_app() {
   fi
 }
 
-# Sólo las aplicaciones que eligió el operador en la pregunta 10/10.
+# Sólo las aplicaciones que eligió el operador en la pregunta 10/11.
 APPS_SEL="${APPS_SEL:-erpnext hrms lending wiki}"
 info "Aplicaciones seleccionadas: ${APPS_SEL:-(ninguna)}"
 for _app in ${APPS_DISPONIBLES:-erpnext hrms lending wiki}; do
@@ -6149,6 +6898,73 @@ fi
 mark_done fase7_arranque
 
 # =============================================================================
+#  FASE 7.6: HTTPS
+#  [H1]
+#  Va al final, con Nginx ya sirviendo el sitio: Let's Encrypt necesita que
+#  /.well-known/ responda por el puerto 80. Si falla, la instalación NO se
+#  da por fallida: el sitio funciona por HTTP y el operador decide si seguir.
+# =============================================================================
+if [[ "${HTTPS_MODO:-http}" != "http" ]]; then
+  phase "FASE 7.6: HTTPS (${HTTPS_MODO})"
+  # El checkpoint lleva el modo: si en una reanudación se elige otro, se aplica.
+  if is_done "fase7_https_${HTTPS_MODO}"; then
+    skip "HTTPS ${HTTPS_MODO}"
+  else
+    avance https RUN
+    actividad "configurando HTTPS (${HTTPS_MODO})"
+    # La tarjeta se repinta cada 3 s y taparía los mensajes y la pregunta.
+    ticker_off; CARD_LINES=0
+    say "\n"
+    while :; do
+      if https_activar "$HTTPS_MODO" "$BENCH_DIR" "$SITE_NAME" "$NEW_USER" "${HTTPS_EMAIL:-}"; then
+        mark_done "fase7_https_${HTTPS_MODO}"
+        avance https OK
+        break
+      fi
+      if [[ "$HTTPS_MODO" != "letsencrypt" ]]; then
+        warn "No se pudo activar HTTPS: el sitio sigue por HTTP. Más tarde: bash $0 --https"
+        avance https ERR
+        break
+      fi
+      say "\n  ${YELLOW}${BOLD}Let's Encrypt no emitió el certificado.${NC} El sitio funciona por HTTP.\n\n"
+      say "    ${BOLD}1${NC}) Continuar con el sitio en HTTP   (HTTPS después: bash $0 --https)\n"
+      say "    ${BOLD}2${NC}) Reintentar                      (tras corregir el DNS o los puertos)\n"
+      say "    ${BOLD}3${NC}) Detener la instalación aquí     (relanza el mismo comando para seguir)\n"
+      HTTPS_DECISION=""
+      while [[ -z "$HTTPS_DECISION" ]]; do
+        say "\n  > "
+        # La entrada del script está cerrada desde la confirmación
+        # (exec 0</dev/null, para que nada se quede esperando una tecla):
+        # la respuesta se lee de la terminal. Sin terminal no hay a quién
+        # preguntar y se sigue en HTTP, que deja el despliegue completo.
+        if (( HAVE_TTY == 1 )) && read -r HTTPS_DECISION </dev/tty; then
+          HTTPS_DECISION="$(trim "$HTTPS_DECISION")"
+        else
+          say "(sin terminal: se continúa en HTTP)\n"
+          HTTPS_DECISION=1
+        fi
+        case "$HTTPS_DECISION" in
+          1|2|3) ;;
+          *) say "  ${RED}Elige 1, 2 o 3.${NC}\n"; HTTPS_DECISION="" ;;
+        esac
+      done
+      case "$HTTPS_DECISION" in
+        2) say "\n"; continue ;;
+        3) avance https ERR   # sin esto, la tarjeta del siguiente intento lo daría "en curso"
+           warn "Instalación detenida en el certificado. Todo lo anterior queda hecho."
+           warn "Corrige el DNS o los puertos y relanza el mismo comando: seguirá desde aquí."
+           exit 1 ;;
+        *) warn "Se continúa con el sitio en HTTP. HTTPS después: bash $0 --https"
+           HTTPS_MODO="http"
+           avance https NA
+           break ;;
+      esac
+    done
+    ticker_on
+  fi
+fi
+
+# =============================================================================
 #  VALIDACIÓN FINAL Y LIMPIEZA
 # =============================================================================
 phase "VALIDACIÓN FINAL"
@@ -6216,20 +7032,34 @@ check "Puerto 80 escuchando"  bash -c "ss -H -tln | grep -q ':80[[:space:]]'"
 check "Directorio del sitio"  test -d "${BENCH_DIR}/sites/${SITE_NAME}"
 check "Login a MariaDB"       mariadb -u root -p"${DB_ROOT_PASS}" -h 127.0.0.1 -e "SELECT 1"
 
-# [v2.2.0] Mismo bug que en el diagnóstico: curl ya emite '000' al fallar.
-HTTP_CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${SITE_NAME}" http://127.0.0.1/ 2>/dev/null)"
-HTTP_CODE="${HTTP_CODE:0:3}"; HTTP_CODE="${HTTP_CODE:-000}"
+# [H1] El estado real sale de site_config.json, no de la respuesta a la
+# pregunta 11: si Let's Encrypt falló y se siguió en HTTP, se valida HTTP.
+# Con HTTPS el puerto 80 responde 301 y esa es la respuesta correcta.
+https_rutas "$BENCH_DIR" "$SITE_NAME"
+if [[ -n "$HTTPS_CRT" ]]; then
+  URL_SITIO="https://${SITE_NAME}/"
+  check "Puerto 443 escuchando"        bash -c "ss -H -tln | grep -q ':443[[:space:]]'"
+  check "Certificado HTTPS vigente"    openssl x509 -checkend 0 -noout -in "$HTTPS_CRT"
+  check "HTTP redirige a HTTPS (301)"  test "$(https_codigo_http "$SITE_NAME")" = 301
+  HTTP_CODE="$(https_codigo_https "$SITE_NAME")"
+else
+  URL_SITIO="http://${SITE_NAME}/"
+  HTTP_CODE="$(https_codigo_http "$SITE_NAME")"
+fi
 VALID_TOTAL=$((VALID_TOTAL+1))
 if [[ "$HTTP_CODE" =~ ^(200|302|303)$ ]]; then
-  ok "El sitio responde por HTTP (${HTTP_CODE})"; VALID_OK=$((VALID_OK+1))
+  ok "El sitio responde en ${URL_SITIO} (${HTTP_CODE})"; VALID_OK=$((VALID_OK+1))
 else
-  warn "El sitio devolvió ${HTTP_CODE}. Revisa: supervisorctl status y ${BENCH_DIR}/logs/"
+  warn "El sitio devolvió ${HTTP_CODE} en ${URL_SITIO}. Revisa: supervisorctl status y ${BENCH_DIR}/logs/"
 fi
 
 info "Cabeceras de seguridad en la respuesta:"
-curl -sI -H "Host: ${SITE_NAME}" http://127.0.0.1/ 2>/dev/null \
-  | grep -iE 'x-frame-options|x-content-type-options|x-xss-protection|^server:' \
-  | sed 's/^/    /' || warn "No se pudieron leer las cabeceras."
+if [[ -n "$HTTPS_CRT" ]]; then
+  curl -skI --resolve "${SITE_NAME}:443:127.0.0.1" "https://${SITE_NAME}/" 2>/dev/null
+else
+  curl -sI -H "Host: ${SITE_NAME}" http://127.0.0.1/ 2>/dev/null
+fi | grep -iE 'x-frame-options|x-content-type-options|x-xss-protection|strict-transport-security|^server:' \
+   | sed 's/^/    /' || warn "No se pudieron leer las cabeceras."
 
 # [T3] Atajos de bench para el usuario operativo. Si ya estaban, no se
 # duplican. Un fallo aquí no toca el despliegue: sólo se avisa.
@@ -6248,7 +7078,7 @@ fi
 {
   echo "# --- Resumen del despliegue $(date -Is) ---"
   echo "# Acceso SSH .....: ssh -p ${SSH_PORT} ${NEW_USER}@<IP>"
-  echo "# URL ............: http://${SITE_NAME}/"
+  echo "# URL ............: ${URL_SITIO}"
   echo "# Usuario app ....: Administrator"
   echo "# Bench ..........: ${BENCH_DIR}"
   echo "# Validación .....: ${VALID_OK}/${VALID_TOTAL} comprobaciones OK"
@@ -6271,6 +7101,24 @@ say "\n"
 # =============================================================================
 SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 
+# [H1] Textos del resumen según cómo quedó el acceso web.
+if [[ -n "$HTTPS_CRT" ]]; then
+  https_cert_info "$HTTPS_CRT"
+  ACCESO_TITULO="ACCESO A LA APLICACIÓN (HTTPS)"
+  ACCESO_PROBAR="curl -kI --resolve ${SITE_NAME}:443:${SERVER_IP} https://${SITE_NAME}/"
+  if [[ "$HTTPS_TIPO" == "letsencrypt" ]]; then
+    PEND_HTTPS="HTTPS con Let's Encrypt hasta el ${HTTPS_VENCE}: se renueva solo (certbot.timer)."
+  else
+    PEND_HTTPS="HTTPS autofirmado hasta el ${HTTPS_VENCE}: el navegador avisará la primera vez.
+     Huella SHA-256: ${HTTPS_HUELLA}
+     Para que no avise, instala como confiable: ${HTTPS_CRT}"
+  fi
+else
+  ACCESO_TITULO="ACCESO A LA APLICACIÓN (local, sin dominio ni SSL)"
+  ACCESO_PROBAR="curl -I -H \"Host: ${SITE_NAME}\" http://${SERVER_IP}/"
+  PEND_HTTPS="Sin HTTPS. Para activarlo (Let's Encrypt o autofirmado): bash $0 --https"
+fi
+
 echo -e "\n### DESPLIEGUE DE FRAPPE ${FRAPPE_VER} FINALIZADO (${VALID_OK}/${VALID_TOTAL}) ###"
 
 say "\n"
@@ -6286,7 +7134,7 @@ fi
 tabla_fila "Frappe"           "${FRAPPE_BRANCH}"
 tabla_fila "Aplicaciones"     "$( [[ -f "${USER_HOME}/.bashcore_apps" ]] && apps_bonitas "$(tr '\n' ' ' < "${USER_HOME}/.bashcore_apps")" || apps_bonitas "${APPS_SEL}" )"
 tabla_sep
-tabla_fila "Sitio"            "http://${SITE_NAME}/"
+tabla_fila "Sitio"            "${URL_SITIO}"
 tabla_fila "IP del servidor"  "${SERVER_IP:-?}"
 tabla_fila "Usuario de la app" "Administrator"
 tabla_sep
@@ -6299,17 +7147,17 @@ tabla_cierra
 say "
 $(echo -e "${BOLD}ACCESO AL SERVIDOR${NC}")
   ssh -p ${SSH_PORT} ${NEW_USER}@${SERVER_IP}
-  Contraseña de '${NEW_USER}': la que indicaste en la pregunta 3/10
+  Contraseña de '${NEW_USER}': la que indicaste en la pregunta 3/11
 
-$(echo -e "${BOLD}ACCESO A LA APLICACIÓN (local, sin dominio ni SSL)${NC}")
-  Desde el servidor : http://${SITE_NAME}/   (ya está en /etc/hosts)
+$(echo -e "${BOLD}${ACCESO_TITULO}${NC}")
+  Desde el servidor : ${URL_SITIO}   (ya está en /etc/hosts)
   Desde tu PC       : añade esta línea al hosts de tu equipo y abre la URL
                         ${SERVER_IP}  ${SITE_NAME}
                       Windows: C:\\Windows\\System32\\drivers\\etc\\hosts
                       Linux/macOS: /etc/hosts
-  Comprobar ahora   : curl -I -H "Host: ${SITE_NAME}" http://${SERVER_IP}/
+  Comprobar ahora   : ${ACCESO_PROBAR}
   Usuario  : Administrator
-  Password : la que indicaste en la pregunta 8/10
+  Password : la que indicaste en la pregunta 8/11
 
 $(echo -e "${BOLD}ARCHIVOS CLAVE${NC}")
   Metadatos    : ${CRED_FILE}   (0600, sin contraseñas)
@@ -6334,7 +7182,7 @@ $(echo -e "${BOLD}COMANDOS ÚTILES${NC}")
 $(echo -e "${YELLOW}${BOLD}PENDIENTES RECOMENDADOS${NC}")
   1) Valida el acceso SSH en OTRA terminal ANTES de cerrar esta sesión.
   2) Apunta el DNS de ${SITE_NAME} a ${SERVER_IP}.
-  3) Despliegue LOCAL: sin HTTPS ni certificados (no hace falta dominio).
+  3) ${PEND_HTTPS}
   4) fail2ban:  sudo apt install fail2ban  (jail sshd puerto ${SSH_PORT})
   5) Backups:   bench --site ${SITE_NAME} backup --with-files  (+ cron)
   6) Guarda tus contraseñas en un gestor: el script no las almacena.
